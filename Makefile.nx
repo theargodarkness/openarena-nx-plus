@@ -194,6 +194,7 @@ SOURCEFILES	:= \
 	code/qcommon/puff.c \
 	code/qcommon/vm.c \
 	code/qcommon/vm_interpreted.c \
+	code/qcommon/vm_aarch64.c \
 	\
 	code/botlib/be_aas_bspq3.c \
 	code/botlib/be_aas_cluster.c \
@@ -281,7 +282,7 @@ VERSION		:=	1.36+3.00a
 DATA		:=	data
 INCLUDES	:=
 DEFINES		+=	-DOPENARENA -DSTANDALONE -DDEFAULT_BASEDIR=\"baseoa\" -DUSE_CURL -DUSE_CODEC_VORBIS -DUSE_CODEC_MP3 -DPRODUCT_VERSION=\"$(VERSION)\" -DARCH_STRING=\"aarch64\" \
-				-DBOTLIB -DNO_VM_COMPILED -DUSE_OPENAL
+				-DBOTLIB -DUSE_OPENAL
 EXEFS_SRC	:=	exefs_src
 #ROMFS	:=	romfs
 

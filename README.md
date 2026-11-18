@@ -39,10 +39,24 @@ Gyro controls can be enabled from the controls section of the settings menu.
 - Right Stick In - Vote Yes
 
 
+## **Split-screen**
+Up to four players on one console, each in their own part of the screen. It works with the stock OpenArena data and mods: every local player is a full client running the unmodified game code.
+
+- Host a game (skirmish or multiplayer), then **hold L+R for a second on another controller** (SL+SR on a sideways Joy-Con) to add a player. Press any button on a controller to take a free seat.
+- Or set the number of players yourself: `splitscreen 2` in the console (1 to 4). It applies straight away when hosting, otherwise on the next map.
+- Two players are stacked; `cl_splitscreenVertical 1` puts them side by side. Three and four players get a quarter each.
+- A single sideways Joy-Con moves with the stick and aims with the gyro. SL jumps, SR fires, and the two buttons on the end are crouch and next weapon. Use the `controllers` command to open the system controller screen and split a Joy-Con pair.
+- `p2_name`, `p2_model`, `p2_headmodel` (and `p3_`, `p4_`) set name and model for the other players; binds are shared.
+- The server needs a free slot per player (`sv_maxclients`).
+- Sound is mixed for player 1. The others hear their own weapon and movement at full volume.
+- Local games only for now: several local players cannot join a remote server.
+
+## **Performance**
+Game code is compiled to native ARM64 when a map loads (the compiler comes from Quake3e). Menus always run interpreted, so if a map ever fails to start you can open the console from the menu and set `vm_jit 0` to go back to the interpreter.
+
 ## **TODO**
 - Diagnose sleep issue.
 - Implement Switch-specific menu settings in both main menu and pause screens.
-- Implement splitscreen multiplayer (probably via switching to the Spearmint engine which requires a renderer/controller code overhaul at minimum, current broken code can be found in the spearmint branch.)
 - Release a dedicated server .nro (for no practical reason other than completion + saying I did.)
 
 

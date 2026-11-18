@@ -444,6 +444,7 @@ vmHeader_t *VM_LoadQVM( vm_t *vm, qboolean alloc, qboolean unpure)
 	// be mask protected
 	dataLength = header.h->dataLength + header.h->litLength +
 		header.h->bssLength;
+	vm->exactDataLength = dataLength;
 	for ( i = 0 ; dataLength > ( 1 << i ) ; i++ ) {
 	}
 	dataLength = 1 << i;
@@ -452,14 +453,14 @@ vmHeader_t *VM_LoadQVM( vm_t *vm, qboolean alloc, qboolean unpure)
 	{
 		// allocate zero filled space for initialized and uninitialized data
 		// leave some space beyond data mask so we can secure all mask operations
-		vm->dataAlloc = dataLength + 4;
+		vm->dataAlloc = dataLength + VM_DATA_GUARD_SIZE;
 		vm->dataBase = Hunk_Alloc(vm->dataAlloc, h_high);
 		vm->dataMask = dataLength - 1;
 	}
 	else
 	{
 		// clear the data, but make sure we're not clearing more than allocated
-		if(vm->dataAlloc != dataLength + 4)
+		if(vm->dataAlloc != dataLength + VM_DATA_GUARD_SIZE)
 		{
 			VM_Free(vm);
 			FS_FreeFile(header.v);
@@ -680,6 +681,15 @@ vm_t *VM_Create( const char *module, intptr_t (*systemCalls)(intptr_t *),
 		interpret = VMI_BYTECODE;
 	}
 #else
+#ifdef __SWITCH__
+	// The compiler is new on this platform, so there is a way back: the menus
+	// always run interpreted (the game starts no matter what), and "vm_jit 0"
+	// from the menu console keeps game code interpreted as well.
+	if ( interpret != VMI_BYTECODE
+		&& ( !Cvar_Get( "vm_jit", "1", CVAR_ARCHIVE )->integer || !Q_stricmp( module, "ui" ) ) ) {
+		interpret = VMI_BYTECODE;
+	}
+#endif
 	if(interpret != VMI_BYTECODE)
 	{
 		vm->compiled = qtrue;

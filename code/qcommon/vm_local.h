@@ -183,7 +183,19 @@ struct vm_s {
 
 	byte		*jumpTableTargets;
 	int			numJumpTableTargets;
+
+	// used by the aarch64 compiler
+	int			*opStack;			// operand stack of the call in progress
+	int			*opStackTop;
+	int			codeSize;			// code without the literal pool that follows it
+	int			exactDataLength;	// data length from the qvm header, before rounding up
+	qboolean	forceDataMask;
+	void		*codeHandle;		// platform handle of the executable memory
 };
+
+// extra room behind the data segment: lets compiled code skip range checks
+// on function arguments, which sit just above the current stack frame
+#define	VM_DATA_GUARD_SIZE	1024
 
 
 extern	vm_t	*currentVM;
