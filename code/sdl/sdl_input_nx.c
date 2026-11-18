@@ -57,6 +57,7 @@ static cvar_t *in_joystick          = NULL;
 static cvar_t *in_joystickThreshold = NULL;
 static cvar_t *in_joyconStickRotate = NULL; // rotate the stick of a sideways single Joy-Con
 static cvar_t *in_gyroSingleJoyCon  = NULL; // a lone Joy-Con always aims with its gyro
+static cvar_t *in_padDebug          = NULL; // print what every pad reports and what it is turned into
 static cvar_t *in_padJoin           = NULL; // holding L+R / SL+SR on a spare pad adds a split-screen player
 static cvar_t *in_joystickUseAnalog = NULL;
 
@@ -500,6 +501,7 @@ typedef struct
 	qboolean anyButton;
 	qboolean joinHeld;						// L+R / SL+SR are down
 	int joinHoldStart;
+	u64 debugDown;							// last raw buttons printed by in_padDebug
 } nxPad_t;
 
 typedef struct
@@ -693,6 +695,20 @@ static void IN_NXReadPad( nxPad_t *p )
 			p->anyButton = qtrue;
 	}
 
+	if( in_padDebug->integer )
+	{
+		// raw HID state whenever the buttons change, to see what a pad really sends
+		if( down != p->debugDown )
+		{
+			HidAnalogStickState rl = padGetStickPos( &p->pad, 0 );
+			HidAnalogStickState rr = padGetStickPos( &p->pad, 1 );
+
+			Com_Printf( "pad%d %s p%d raw %08x%08x L(%d,%d) R(%d,%d)\n", (int)( p - nx_pads ), IN_NXStyleName( p->style ),
+				p->player, (unsigned int)( down >> 32 ), (unsigned int)down, rl.x, rl.y, rr.x, rr.y );
+			p->debugDown = down;
+		}
+	}
+
 	axes[SDL_CONTROLLER_AXIS_LEFTX]  = IN_NXClampAxis( l.x );
 	axes[SDL_CONTROLLER_AXIS_LEFTY]  = IN_NXClampAxis( -l.y );
 	axes[SDL_CONTROLLER_AXIS_RIGHTX] = IN_NXClampAxis( r.x );
@@ -713,9 +729,9 @@ static void IN_NXReadPad( nxPad_t *p )
 ===============
 IN_NXPollPads
 
-Read the current state of every pad. A pad that is not connected (or
-in_joystick 0) reads as fully released, which is what makes held buttons
-let go instead of staying latched.
+Read the current state of every pad. A pad that is not connected reads as
+fully released, which is what makes held buttons let go instead of staying
+latched.
 ===============
 */
 static void IN_NXPollPads( void )
@@ -737,7 +753,9 @@ static void IN_NXPollPads( void )
 		if( style != p->style )
 			IN_NXPadChanged( p, slot, style );
 
-		if( style && in_joystick->integer )
+		// Controllers are the console's main input, so they are always read;
+		// in_joystick (a desktop setting some menus write to) is ignored.
+		if( style )
 			IN_NXReadPad( p );
 
 		if( !p->joinHeld )
@@ -1005,6 +1023,14 @@ player unless an SE_PLAYER event comes right before them.
 */
 static void IN_QueuePlayerEvent( int player, sysEventType_t type, int value, int value2 )
 {
+	if( in_padDebug->integer && type == SE_KEY )
+	{
+		const char *bind = Key_GetBinding( value );
+
+		Com_Printf( " -> player %d %s %s = %s\n", player + 1, Key_KeynumToString( value ),
+			value2 ? "down" : "up", ( bind && bind[0] ) ? bind : "(not bound)" );
+	}
+
 	if( player > 0 )
 		Com_QueueEvent( in_eventTime, SE_PLAYER, player, 0, 0, NULL );
 	Com_QueueEvent( in_eventTime, type, value, value2, 0, NULL );
@@ -1863,6 +1889,7 @@ void IN_Init( void *windowData )
 	in_joyconStickRotate = Cvar_Get( "in_joyconStickRotate", "1", CVAR_ARCHIVE );
 	in_gyroSingleJoyCon = Cvar_Get( "in_gyroSingleJoyCon", "1", CVAR_ARCHIVE );
 	in_padJoin = Cvar_Get( "in_padJoin", "1", CVAR_ARCHIVE );
+	in_padDebug = Cvar_Get( "in_padDebug", "0", CVAR_TEMP );
 
 	mouseAvailable = ( in_mouse->value != 0 );
 	IN_DeactivateMouse( Cvar_VariableIntegerValue( "r_fullscreen" ) != 0 );
