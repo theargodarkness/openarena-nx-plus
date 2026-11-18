@@ -23,8 +23,47 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "client.h"
 
-unsigned	frame_msec;
-int			old_com_frameTime;
+// Split-screen: all button and timing state exists once per local client.
+// The names below are macros for the state of the client that is selected
+// (see CL_SetLocalClient), so the rest of this file reads as it always did.
+typedef struct {
+	unsigned	frame_msec;
+	int			old_com_frameTime;
+
+	kbutton_t	in_left, in_right, in_forward, in_back;
+	kbutton_t	in_lookup, in_lookdown, in_moveleft, in_moveright;
+	kbutton_t	in_strafe, in_speed;
+	kbutton_t	in_up, in_down;
+#ifdef USE_VOIP
+	kbutton_t	in_voiprecord;
+#endif
+	kbutton_t	in_buttons[16];
+
+	qboolean	in_mlooking;
+	float		turn180Remaining;
+} clInput_t;
+
+static clInput_t	cl_inputs[MAX_LOCAL_CLIENTS];
+
+#define CL_INPUT			( cl_inputs[cl_localClient] )
+#define frame_msec			CL_INPUT.frame_msec
+#define old_com_frameTime	CL_INPUT.old_com_frameTime
+#define in_left				CL_INPUT.in_left
+#define in_right			CL_INPUT.in_right
+#define in_forward			CL_INPUT.in_forward
+#define in_back				CL_INPUT.in_back
+#define in_lookup			CL_INPUT.in_lookup
+#define in_lookdown			CL_INPUT.in_lookdown
+#define in_moveleft			CL_INPUT.in_moveleft
+#define in_moveright		CL_INPUT.in_moveright
+#define in_strafe			CL_INPUT.in_strafe
+#define in_speed			CL_INPUT.in_speed
+#define in_up				CL_INPUT.in_up
+#define in_down				CL_INPUT.in_down
+#define in_voiprecord		CL_INPUT.in_voiprecord
+#define in_buttons			CL_INPUT.in_buttons
+#define in_mlooking			CL_INPUT.in_mlooking
+#define turn180Remaining	CL_INPUT.turn180Remaining
 
 /*
 ===============================================================================
@@ -47,19 +86,6 @@ at the same time.
 */
 
 
-kbutton_t	in_left, in_right, in_forward, in_back;
-kbutton_t	in_lookup, in_lookdown, in_moveleft, in_moveright;
-kbutton_t	in_strafe, in_speed;
-kbutton_t	in_up, in_down;
-
-#ifdef USE_VOIP
-kbutton_t	in_voiprecord;
-#endif
-
-kbutton_t	in_buttons[16];
-
-
-qboolean	in_mlooking;
 
 
 void IN_MLookDown( void ) {
@@ -300,7 +326,6 @@ static qboolean CL_Q3AimAllowed( void ) {
 
 static cvar_t	*cl_turn180time;
 static cvar_t	*cl_adsScale;
-static float	turn180Remaining;
 static cvar_t	*cl_aimAssist;
 static cvar_t	*cl_aimAssistAngle;
 static cvar_t	*cl_aimAssistStrength;
@@ -588,10 +613,35 @@ void CL_KeyMove( usercmd_t *cmd ) {
 
 /*
 =================
+CL_ClearLocalClientInput
+
+Forget every held button of a split-screen player who left
+=================
+*/
+void CL_ClearLocalClientInput( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_LOCAL_CLIENTS ) {
+		return;
+	}
+	Com_Memset( &cl_inputs[clientNum], 0, sizeof( cl_inputs[clientNum] ) );
+}
+
+/*
+=================
 CL_MouseEvent
 =================
 */
 void CL_MouseEvent( int dx, int dy, int time ) {
+	int player = CL_EventPlayer();
+
+	if ( player > 0 ) {
+		// an extra split-screen player only ever aims; menus belong to player 1
+		CL_SetLocalClient( player );
+		cl.mouseDx[cl.mouseIndex] += dx;
+		cl.mouseDy[cl.mouseIndex] += dy;
+		CL_SetLocalClient( 0 );
+		return;
+	}
+
 	if ( Key_GetCatcher( ) & KEYCATCH_UI ) {
 		VM_Call( uivm, UI_MOUSE_EVENT, dx, dy );
 	} else if (Key_GetCatcher( ) & KEYCATCH_CGAME) {
@@ -613,6 +663,14 @@ void CL_JoystickEvent( int axis, int value, int time ) {
 	if ( axis < 0 || axis >= MAX_JOYSTICK_AXIS ) {
 		Com_Error( ERR_DROP, "CL_JoystickEvent: bad axis %i", axis );
 	}
+
+	if ( CL_EventPlayer() > 0 ) {
+		CL_SetLocalClient( CL_EventPlayer() );
+		cl.joystickAxis[axis] = value;
+		CL_SetLocalClient( 0 );
+		return;
+	}
+
 	cl.joystickAxis[axis] = value;
 }
 

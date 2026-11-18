@@ -43,7 +43,7 @@ int		vm_debugLevel;
 // used by Com_Error to get rid of running vm's before longjmp
 static int forced_unload;
 
-#define	MAX_VM		3
+#define	MAX_VM		( 3 + MAX_LOCAL_CLIENTS - 1 )	// game, ui, and a cgame per local client
 vm_t	vmTable[MAX_VM];
 
 
@@ -573,6 +573,26 @@ If image ends in .qvm it will be interpreted, otherwise
 it will attempt to load as a system dll
 ================
 */
+static qboolean vm_createInstance = qfalse;
+
+/*
+================
+VM_CreateInstance
+
+Like VM_Create, but always loads a fresh copy even if the module is already
+running. Split-screen runs one cgame per local client this way; it only
+makes sense for bytecode, since a native library has a single set of globals.
+================
+*/
+vm_t *VM_CreateInstance( const char *module, intptr_t (*systemCalls)(intptr_t *),
+				vmInterpret_t interpret ) {
+	if ( interpret == VMI_NATIVE ) {
+		interpret = VMI_COMPILED;
+	}
+	vm_createInstance = qtrue;
+	return VM_Create( module, systemCalls, interpret );
+}
+
 vm_t *VM_Create( const char *module, intptr_t (*systemCalls)(intptr_t *), 
 				vmInterpret_t interpret ) {
 	vm_t		*vm;
@@ -588,12 +608,13 @@ vm_t *VM_Create( const char *module, intptr_t (*systemCalls)(intptr_t *),
 	remaining = Hunk_MemoryRemaining();
 
 	// see if we already have the VM
-	for ( i = 0 ; i < MAX_VM ; i++ ) {
+	for ( i = 0 ; i < MAX_VM && !vm_createInstance ; i++ ) {
 		if (!Q_stricmp(vmTable[i].name, module)) {
 			vm = &vmTable[i];
 			return vm;
 		}
 	}
+	vm_createInstance = qfalse;
 
 	// find a free vm
 	for ( i = 0 ; i < MAX_VM ; i++ ) {

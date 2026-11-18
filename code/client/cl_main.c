@@ -122,10 +122,7 @@ cvar_t	*cl_consoleKeys;
 
 cvar_t	*cl_rate;
 
-clientActive_t		cl;
-clientConnection_t	clc;
 clientStatic_t		cls;
-vm_t				*cgvm;
 
 char				cl_reconnectArgs[MAX_OSPATH];
 char				cl_oldGame[MAX_QPATH];
@@ -159,6 +156,7 @@ static int noGameRestart = qfalse;
 
 extern void SV_BotFrame( int time );
 void CL_CheckForResend( void );
+void CL_SendPureChecksums( void );
 void CL_ShowIP_f(void);
 void CL_ServerStatus_f(void);
 void CL_ServerStatusResponse( netadr_t from, msg_t *msg );
@@ -1198,6 +1196,496 @@ void CL_NextDemo( void ) {
 //======================================================================
 
 /*
+=============================================================================
+
+SPLIT-SCREEN
+
+Every local player is a complete client: its own connection to the server,
+its own game state and its own cgame VM, drawn into its own part of the
+screen. The stock game code runs unmodified - it never learns that it is
+sharing the machine.
+
+"cl", "clc" and "cgvm" are macros for the currently selected local client.
+Code that runs for one client at a time (packet parsing, building usercmds,
+cgame system calls) selects it with CL_SetLocalClient() and switches back
+to client 0, the primary, when it is done. The primary owns everything that
+is not per-player: menus, console, demos, downloads, music.
+
+=============================================================================
+*/
+
+static clientActive_t		cl_actives[MAX_LOCAL_CLIENTS];
+static clientConnection_t	cl_connections[MAX_LOCAL_CLIENTS];
+
+clientActive_t		*cl_current = &cl_actives[0];
+clientConnection_t	*clc_current = &cl_connections[0];
+vm_t				*cl_cgvms[MAX_LOCAL_CLIENTS];
+
+int					cl_localClient = 0;
+int					cl_numLocalClients = 1;
+
+static int			cl_eventPlayer = 0;
+static qboolean		cl_userinfoDirty[MAX_LOCAL_CLIENTS];
+qboolean			cl_dropLocalClient[MAX_LOCAL_CLIENTS];
+
+cvar_t				*cl_splitscreen;
+cvar_t				*cl_splitscreenVertical;
+
+// userinfo keys a player other than the first can override, as p2_name,
+// p3_model and so on; an empty cvar means "same as player 1"
+static const char *cl_playerInfoKeys[] = {
+	"name", "model", "headmodel", "team_model", "team_headmodel",
+	"color1", "color2", "handicap", "sex"
+};
+static cvar_t		*cl_playerInfoCvars[MAX_LOCAL_CLIENTS][ARRAY_LEN( cl_playerInfoKeys )];
+
+/*
+=====================
+CL_SetLocalClient
+=====================
+*/
+void CL_SetLocalClient( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_LOCAL_CLIENTS ) {
+		clientNum = 0;
+	}
+
+	cl_localClient = clientNum;
+	cl_current = &cl_actives[clientNum];
+	clc_current = &cl_connections[clientNum];
+	NET_SetLoopClient( clientNum );
+}
+
+/*
+=====================
+CL_LocalClientState
+=====================
+*/
+connstate_t CL_LocalClientState( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_LOCAL_CLIENTS ) {
+		return CA_UNINITIALIZED;
+	}
+	return cl_connections[clientNum].state;
+}
+
+/*
+=====================
+CL_LocalClientMessage
+
+What the server last told a local client that is trying to connect
+(e.g. "Server is full")
+=====================
+*/
+const char *CL_LocalClientMessage( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_LOCAL_CLIENTS ) {
+		return "";
+	}
+	return cl_connections[clientNum].serverMessage;
+}
+
+/*
+=====================
+CL_LocalClientRuns
+
+The extra clients only run while the primary is in the game. While it is
+connecting or loading they are frozen, so there is exactly one client
+deciding when client memory is flushed and reloaded.
+=====================
+*/
+qboolean CL_LocalClientRuns( int clientNum ) {
+	connstate_t primary;
+
+	if ( clientNum == 0 ) {
+		return qtrue;
+	}
+	if ( clientNum < 0 || clientNum >= cl_numLocalClients ) {
+		return qfalse;
+	}
+
+	primary = cl_connections[0].state;
+	return ( primary == CA_PRIMED || primary == CA_ACTIVE ) && !cl_connections[0].demoplaying;
+}
+
+/*
+=====================
+CL_GetViewport
+
+Screen rectangle of a local client, in pixels with y going down.
+Two players are stacked (or side by side with cl_splitscreenVertical),
+three and four get a quarter each.
+=====================
+*/
+void CL_GetViewport( int clientNum, int *x, int *y, int *w, int *h ) {
+	int vw = cls.glconfig.vidWidth;
+	int vh = cls.glconfig.vidHeight;
+
+	*x = 0;
+	*y = 0;
+	*w = vw;
+	*h = vh;
+
+	if ( cl_numLocalClients < 2 || clientNum < 0 || clientNum >= MAX_LOCAL_CLIENTS ) {
+		return;
+	}
+
+	if ( cl_numLocalClients == 2 ) {
+		if ( cl_splitscreenVertical && cl_splitscreenVertical->integer ) {
+			*w = vw / 2;
+			*x = clientNum ? vw - *w : 0;
+		} else {
+			*h = vh / 2;
+			*y = clientNum ? vh - *h : 0;
+		}
+		return;
+	}
+
+	*w = vw / 2;
+	*h = vh / 2;
+	*x = ( clientNum & 1 ) ? vw - *w : 0;
+	*y = ( clientNum & 2 ) ? vh - *h : 0;
+}
+
+/*
+=====================
+CL_SetEventPlayer / CL_EventPlayer
+
+Which local player the input event being handled came from
+=====================
+*/
+void CL_SetEventPlayer( int player ) {
+	if ( player < 0 || player >= cl_numLocalClients ) {
+		player = 0;
+	}
+	cl_eventPlayer = player;
+}
+
+int CL_EventPlayer( void ) {
+	return cl_eventPlayer;
+}
+
+/*
+=====================
+CL_UserinfoString
+
+The userinfo of the current local client: the shared userinfo cvars, with
+the p<N>_ overrides applied for players after the first.
+=====================
+*/
+void CL_UserinfoString( char *info, int size ) {
+	int i;
+
+	Q_strncpyz( info, Cvar_InfoString( CVAR_USERINFO ), size );
+
+	if ( cl_localClient == 0 ) {
+		return;
+	}
+
+	for ( i = 0; i < ARRAY_LEN( cl_playerInfoKeys ); i++ ) {
+		cvar_t *cv = cl_playerInfoCvars[cl_localClient][i];
+
+		if ( cv && cv->string[0] ) {
+			Info_SetValueForKey( info, cl_playerInfoKeys[i], cv->string );
+		}
+	}
+}
+
+static void CL_InitLocalClientCvars( void ) {
+	int i, j;
+
+	for ( i = 1; i < MAX_LOCAL_CLIENTS; i++ ) {
+		for ( j = 0; j < ARRAY_LEN( cl_playerInfoKeys ); j++ ) {
+			const char *def = "";
+
+			if ( !strcmp( cl_playerInfoKeys[j], "name" ) ) {
+				def = va( "Player%d", i + 1 );
+			}
+			cl_playerInfoCvars[i][j] = Cvar_Get( va( "p%d_%s", i + 1, cl_playerInfoKeys[j] ), def, CVAR_ARCHIVE );
+			cl_playerInfoCvars[i][j]->modified = qfalse;
+		}
+	}
+}
+
+/*
+=====================
+CL_PumpLoopback
+
+Called by the event loop to deliver loopback packets to every local client
+=====================
+*/
+void CL_PumpLoopback( msg_t *buf ) {
+	netadr_t	from;
+	int			i;
+	int			prev = cl_localClient;
+
+	for ( i = 0; i < MAX_LOCAL_CLIENTS; i++ ) {
+		if ( !CL_LocalClientRuns( i ) ) {
+			continue;
+		}
+
+		CL_SetLocalClient( i );
+		while ( NET_GetLoopPacket( NS_CLIENT, &from, buf ) ) {
+			CL_PacketEvent( from, buf );
+			CL_SetLocalClient( i );
+
+			// the primary may have dropped out of the game while parsing
+			if ( !CL_LocalClientRuns( i ) ) {
+				break;
+			}
+		}
+	}
+
+	CL_SetLocalClient( prev );
+}
+
+/*
+=====================
+CL_ShutdownCGames
+
+Shut down the cgame of every local client
+=====================
+*/
+void CL_ShutdownCGames( void ) {
+	int i;
+	int prev = cl_localClient;
+
+	for ( i = MAX_LOCAL_CLIENTS - 1; i >= 0; i-- ) {
+		CL_SetLocalClient( i );
+		CL_ShutdownCGame();
+	}
+
+	CL_SetLocalClient( prev );
+}
+
+/*
+=====================
+CL_DisconnectLocalClient
+
+Take one of the extra clients out of the game. The primary, and with it the
+whole session, goes through CL_Disconnect instead. Must not be called from
+inside that client's own cgame.
+=====================
+*/
+void CL_DisconnectLocalClient( int clientNum ) {
+	int prev = cl_localClient;
+
+	if ( clientNum <= 0 || clientNum >= MAX_LOCAL_CLIENTS ) {
+		return;
+	}
+
+	CL_SetLocalClient( clientNum );
+	cl_dropLocalClient[clientNum] = qfalse;
+
+	CL_ShutdownCGame();
+
+	// send it a few times in case one is dropped
+	if ( clc.state >= CA_CONNECTED ) {
+		CL_AddReliableCommand( "disconnect", qtrue );
+		CL_WritePacket();
+		CL_WritePacket();
+		CL_WritePacket();
+	}
+
+	CL_ClearState();
+	Com_Memset( &clc, 0, sizeof( clc ) );
+	clc.state = CA_DISCONNECTED;
+	CL_ClearLocalClientInput( clientNum );
+
+	CL_SetLocalClient( prev == clientNum ? 0 : prev );
+}
+
+/*
+=====================
+CL_ConnectLocalClient
+
+Connect the current (extra) local client to the local server, the same way
+CL_MapLoading does it for the primary
+=====================
+*/
+static void CL_ConnectLocalClient( void ) {
+	CL_ClearState();
+	Com_Memset( &clc, 0, sizeof( clc ) );
+
+	Q_strncpyz( clc.servername, "localhost", sizeof( clc.servername ) );
+	clc.state = CA_CHALLENGING;
+	clc.connectTime = -RETRANSMIT_TIMEOUT;
+	NET_StringToAdr( clc.servername, &clc.serverAddress, NA_UNSPEC );
+	// loopback addresses tell the local clients apart by port
+	clc.serverAddress.port = cl_localClient;
+
+	// we don't need a challenge on the localhost
+	CL_CheckForResend();
+}
+
+/*
+=====================
+CL_UpdateLocalClients
+
+Once the primary is in the game on our own server, bring the extra clients
+in, and give them their cgame back if it was flushed along with the
+primary's (vid_restart, snd_restart).
+=====================
+*/
+static void CL_UpdateLocalClients( void ) {
+	int i;
+
+	if ( cl_numLocalClients < 2 ) {
+		return;
+	}
+	if ( cl_connections[0].state != CA_ACTIVE || cl_connections[0].demoplaying ) {
+		return;
+	}
+
+	for ( i = 1; i < cl_numLocalClients; i++ ) {
+		CL_SetLocalClient( i );
+
+		if ( clc.state <= CA_DISCONNECTED ) {
+			if ( com_sv_running->integer ) {
+				CL_ConnectLocalClient();
+			}
+		} else if ( clc.state >= CA_PRIMED && !cgvm && cl.serverId == cl_actives[0].serverId ) {
+			CL_InitCGame();
+			CL_SendPureChecksums();
+		}
+	}
+
+	CL_SetLocalClient( 0 );
+}
+
+/*
+=====================
+CL_SetNumLocalClients
+=====================
+*/
+static void CL_SetNumLocalClients( int num ) {
+	int i;
+
+	if ( num < 1 ) {
+		num = 1;
+	}
+	if ( num > MAX_LOCAL_CLIENTS ) {
+		num = MAX_LOCAL_CLIENTS;
+	}
+
+	for ( i = num; i < MAX_LOCAL_CLIENTS; i++ ) {
+		CL_DisconnectLocalClient( i );
+	}
+	cl_numLocalClients = num;
+}
+
+/*
+=====================
+CL_Splitscreen_f
+
+splitscreen <players>: takes effect straight away when hosting a game,
+otherwise on the next map
+=====================
+*/
+static void CL_Splitscreen_f( void ) {
+	int num;
+
+	if ( Cmd_Argc() < 2 ) {
+		Com_Printf( "usage: splitscreen <1-%d>\n%d local player(s) in this game, %d set for the next\n",
+			MAX_LOCAL_CLIENTS, cl_numLocalClients, cl_splitscreen->integer );
+		return;
+	}
+
+	num = atoi( Cmd_Argv( 1 ) );
+	if ( num < 1 ) {
+		num = 1;
+	}
+	if ( num > MAX_LOCAL_CLIENTS ) {
+		num = MAX_LOCAL_CLIENTS;
+	}
+	Cvar_Set( "cl_splitscreen", va( "%d", num ) );
+
+	if ( cl_localClient != 0 ) {
+		return;
+	}
+
+	if ( cl_connections[0].state == CA_ACTIVE && com_sv_running->integer && !cl_connections[0].demoplaying ) {
+		CL_SetNumLocalClients( num );
+		// the server needs room for everyone
+		if ( Cvar_VariableIntegerValue( "sv_maxclients" ) < num ) {
+			Com_Printf( "sv_maxclients is below %d; extra players may not fit\n", num );
+		}
+	}
+}
+
+/*
+=====================
+CL_LocalPlayer_f
+
+lp <player> <command>: run a command as one of the local players. Button
+binds from a player's controller arrive this way.
+=====================
+*/
+static void CL_LocalPlayer_f( void ) {
+	char	cmd[MAX_STRING_CHARS];
+	int		num;
+	int		prev = cl_localClient;
+
+	if ( Cmd_Argc() < 3 ) {
+		Com_Printf( "usage: lp <player 0-%d> <command>\n", MAX_LOCAL_CLIENTS - 1 );
+		return;
+	}
+
+	num = atoi( Cmd_Argv( 1 ) );
+	if ( num < 0 || num >= cl_numLocalClients ) {
+		return;
+	}
+
+	Q_strncpyz( cmd, Cmd_ArgsFrom( 2 ), sizeof( cmd ) );
+
+	CL_SetLocalClient( num );
+	Cmd_ExecuteString( cmd );
+	CL_SetLocalClient( prev );
+}
+
+/*
+=====================
+CL_AddPlayerCommandText
+
+Queue command text on behalf of a local player. Each command in the text
+is wrapped in "lp" so it still belongs to that player when the command
+buffer gets around to running it.
+=====================
+*/
+void CL_AddPlayerCommandText( int player, const char *text ) {
+	char		line[MAX_STRING_CHARS];
+	int			len = 0;
+	qboolean	quoted = qfalse;
+
+	if ( player <= 0 ) {
+		Cbuf_AddText( text );
+		return;
+	}
+
+	for ( ;; text++ ) {
+		char c = *text;
+
+		if ( c == '"' ) {
+			quoted = !quoted;
+		}
+
+		if ( c == '\0' || c == '\n' || c == '\r' || ( c == ';' && !quoted ) ) {
+			line[len] = '\0';
+			if ( len > 0 ) {
+				Cbuf_AddText( va( "lp %d %s\n", player, line ) );
+			}
+			len = 0;
+			quoted = qfalse;
+			if ( c == '\0' ) {
+				break;
+			}
+			continue;
+		}
+
+		if ( len < (int)sizeof( line ) - 1 ) {
+			line[len++] = c;
+		}
+	}
+}
+
+/*
 =====================
 CL_ShutdownAll
 =====================
@@ -1216,9 +1704,12 @@ void CL_ShutdownAll(qboolean shutdownRef)
 	// clear sounds
 	S_DisableSounds();
 	// shutdown CGame
-	CL_ShutdownCGame();
+	CL_ShutdownCGames();
 	// shutdown UI
 	CL_ShutdownUI();
+
+	// the renderer forgets the world along with everything else
+	cl_worldMapLoaded = qfalse;
 
 	// shutdown the renderer
 	if(shutdownRef)
@@ -1295,8 +1786,27 @@ void CL_MapLoading( void ) {
 	Con_Close();
 	Key_SetCatcher( 0 );
 
+	CL_SetLocalClient( 0 );
+
 	// if we are already connected to the local host, stay connected
 	if ( clc.state >= CA_CONNECTED && !Q_stricmp( clc.servername, "localhost" ) ) {
+		int i;
+
+		// the number of local players can change between maps
+		CL_SetNumLocalClients( cl_splitscreen->integer );
+
+		// the extra clients stay connected too and wait for the new gamestate
+		for ( i = 1; i < cl_numLocalClients; i++ ) {
+			CL_SetLocalClient( i );
+			if ( clc.state >= CA_CONNECTED ) {
+				clc.state = CA_CONNECTED;
+				Com_Memset( clc.serverMessage, 0, sizeof( clc.serverMessage ) );
+				Com_Memset( &cl.gameState, 0, sizeof( cl.gameState ) );
+				clc.lastPacketSentTime = -9999;
+			}
+		}
+		CL_SetLocalClient( 0 );
+
 		clc.state = CA_CONNECTED;		// so the connect screen is drawn
 		Com_Memset( cls.updateInfoString, 0, sizeof( cls.updateInfoString ) );
 		Com_Memset( clc.serverMessage, 0, sizeof( clc.serverMessage ) );
@@ -1307,6 +1817,8 @@ void CL_MapLoading( void ) {
 		// clear nextmap so the cinematic shutdown doesn't execute it
 		Cvar_Set( "nextmap", "" );
 		CL_Disconnect( qtrue );
+		// the extra local clients join once the primary is in the game
+		CL_SetNumLocalClients( cl_splitscreen->integer );
 		Q_strncpyz( clc.servername, "localhost", sizeof(clc.servername) );
 		clc.state = CA_CHALLENGING;		// so the connect screen is drawn
 		Key_SetCatcher( 0 );
@@ -1377,9 +1889,19 @@ This is also called on Com_Error and Com_Quit, so it shouldn't cause any errors
 =====================
 */
 void CL_Disconnect( qboolean showMainMenu ) {
+	int i;
+
 	if ( !com_cl_running || !com_cl_running->integer ) {
 		return;
 	}
+
+	// the extra split-screen clients leave with the primary
+	for ( i = 1; i < MAX_LOCAL_CLIENTS; i++ ) {
+		if ( cl_dropLocalClient[i] || CL_LocalClientState( i ) > CA_DISCONNECTED || cl_cgvms[i] ) {
+			CL_DisconnectLocalClient( i );
+		}
+	}
+	CL_SetLocalClient( 0 );
 
 	// shutting down the client so enter full screen ui mode
 	Cvar_Set("r_uiFullScreen", "1");
@@ -1957,8 +2479,9 @@ void CL_Vid_Restart_f( void ) {
 		// shutdown the UI
 		CL_ShutdownUI();
 		// shutdown the CGame
-		CL_ShutdownCGame();
+		CL_ShutdownCGames();
 		// shutdown the renderer and clear the renderer interface
+		cl_worldMapLoaded = qfalse;
 		CL_ShutdownRef();
 		// client is no longer pure until new checksums are sent
 		CL_ResetPureClientAtServer();
@@ -2122,23 +2645,27 @@ void CL_DownloadsComplete( void ) {
 	// let the client game init and load data
 	clc.state = CA_LOADING;
 
-	// Pump the loop, this may change gamestate!
-	Com_EventLoop();
+	// An extra split-screen client joins a game the primary has already
+	// loaded: everything it needs is registered, so it only starts its cgame.
+	if ( cl_localClient == 0 ) {
+		// Pump the loop, this may change gamestate!
+		Com_EventLoop();
 
-	// if the gamestate was changed by calling Com_EventLoop
-	// then we loaded everything already and we don't want to do it again.
-	if ( clc.state != CA_LOADING ) {
-		return;
+		// if the gamestate was changed by calling Com_EventLoop
+		// then we loaded everything already and we don't want to do it again.
+		if ( clc.state != CA_LOADING ) {
+			return;
+		}
+
+		// starting to load a map so we get out of full screen ui mode
+		Cvar_Set("r_uiFullScreen", "0");
+
+		// flush client memory and start loading stuff
+		// this will also (re)load the UI
+		// if this is a local client then only the client part of the hunk
+		// will be cleared, note that this is done after the hunk mark has been set
+		CL_FlushMemory();
 	}
-
-	// starting to load a map so we get out of full screen ui mode
-	Cvar_Set("r_uiFullScreen", "0");
-
-	// flush client memory and start loading stuff
-	// this will also (re)load the UI
-	// if this is a local client then only the client part of the hunk
-	// will be cleared, note that this is done after the hunk mark has been set
-	CL_FlushMemory();
 
 	// initialize the CGame
 	cls.cgameStarted = qtrue;
@@ -2375,9 +2902,10 @@ void CL_CheckForResend( void ) {
 		
 	case CA_CHALLENGING:
 		// sending back the challenge
-		port = Cvar_VariableValue ("net_qport");
+		// every local client needs a qport of its own
+		port = ( (int)Cvar_VariableValue ("net_qport") + cl_localClient ) & 0xffff;
 
-		Q_strncpyz( info, Cvar_InfoString( CVAR_USERINFO ), sizeof( info ) );
+		CL_UserinfoString( info, sizeof( info ) );
 		
 #ifdef LEGACY_PROTOCOL
 		if(com_legacyprotocol->integer == com_protocol->integer)
@@ -2395,7 +2923,10 @@ void CL_CheckForResend( void ) {
 		NET_OutOfBandData( NS_CLIENT, clc.serverAddress, (byte *) data, strlen ( data ) );
 		// the most current userinfo has been sent, so watch for any
 		// newer changes to userinfo variables
-		cvar_modifiedFlags &= ~CVAR_USERINFO;
+		cl_userinfoDirty[cl_localClient] = qfalse;
+		if ( cl_localClient == 0 && cl_numLocalClients < 2 ) {
+			cvar_modifiedFlags &= ~CVAR_USERINFO;
+		}
 		break;
 
 	default:
@@ -2724,10 +3255,10 @@ void CL_ConnectionlessPacket( netadr_t from, msg_t *msg ) {
 		}
 
 #ifdef LEGACY_PROTOCOL
-		Netchan_Setup(NS_CLIENT, &clc.netchan, from, Cvar_VariableValue("net_qport"),
+		Netchan_Setup(NS_CLIENT, &clc.netchan, from, ( (int)Cvar_VariableValue("net_qport") + cl_localClient ) & 0xffff,
 			      clc.challenge, clc.compat);
 #else
-		Netchan_Setup(NS_CLIENT, &clc.netchan, from, Cvar_VariableValue("net_qport"),
+		Netchan_Setup(NS_CLIENT, &clc.netchan, from, ( (int)Cvar_VariableValue("net_qport") + cl_localClient ) & 0xffff,
 			      clc.challenge, qfalse);
 #endif
 
@@ -2872,6 +3403,11 @@ void CL_CheckTimeout( void ) {
 	    && cls.realtime - clc.lastPacketTime > cl_timeout->value*1000) {
 		if (++cl.timeoutcount > 5) {	// timeoutcount saves debugger
 			Com_Printf ("\nServer connection timed out.\n");
+			if ( cl_localClient > 0 ) {
+				CL_DisconnectLocalClient( cl_localClient );
+				CL_SetLocalClient( 0 );
+				return;
+			}
 			CL_Disconnect( qtrue );
 			return;
 		}
@@ -2915,10 +3451,13 @@ void CL_CheckUserinfo( void ) {
 		return;
 
 	// send a reliable userinfo update if needed
-	if(cvar_modifiedFlags & CVAR_USERINFO)
+	if ( cl_userinfoDirty[cl_localClient] )
 	{
-		cvar_modifiedFlags &= ~CVAR_USERINFO;
-		CL_AddReliableCommand(va("userinfo \"%s\"", Cvar_InfoString( CVAR_USERINFO ) ), qfalse);
+		char info[MAX_INFO_STRING];
+
+		cl_userinfoDirty[cl_localClient] = qfalse;
+		CL_UserinfoString( info, sizeof( info ) );
+		CL_AddReliableCommand(va("userinfo \"%s\"", info ), qfalse);
 	}
 }
 
@@ -2929,10 +3468,14 @@ CL_Frame
 ==================
 */
 void CL_Frame ( int msec ) {
+	int i, j;
 
 	if ( !com_cl_running->integer ) {
 		return;
 	}
+
+	// an error can leave another local client selected
+	CL_SetLocalClient( 0 );
 
 #ifdef USE_CURL
 	if(clc.downloadCURLM) {
@@ -3028,21 +3571,56 @@ void CL_Frame ( int msec ) {
 		SCR_DebugGraph ( cls.realFrametime * 0.25 );
 	}
 
-	// see if we need to update any userinfo
-	CL_CheckUserinfo();
+	// a changed userinfo cvar concerns every local client, a changed
+	// p<N>_ cvar only that player
+	if ( cvar_modifiedFlags & CVAR_USERINFO ) {
+		cvar_modifiedFlags &= ~CVAR_USERINFO;
+		for ( i = 0; i < MAX_LOCAL_CLIENTS; i++ ) {
+			cl_userinfoDirty[i] = qtrue;
+		}
+	}
+	for ( i = 1; i < MAX_LOCAL_CLIENTS; i++ ) {
+		for ( j = 0; j < ARRAY_LEN( cl_playerInfoKeys ); j++ ) {
+			if ( cl_playerInfoCvars[i][j] && cl_playerInfoCvars[i][j]->modified ) {
+				cl_playerInfoCvars[i][j]->modified = qfalse;
+				cl_userinfoDirty[i] = qtrue;
+			}
+		}
+	}
 
-	// if we haven't gotten a packet in a long time,
-	// drop the connection
-	CL_CheckTimeout();
+	for ( i = 0; i < MAX_LOCAL_CLIENTS; i++ ) {
+		if ( !CL_LocalClientRuns( i ) ) {
+			continue;
+		}
 
-	// send intentions now
-	CL_SendCmd();
+		CL_SetLocalClient( i );
 
-	// resend a connection request if necessary
-	CL_CheckForResend();
+		// the server told this extra client to go
+		if ( i > 0 && cl_dropLocalClient[i] ) {
+			CL_DisconnectLocalClient( i );
+			continue;
+		}
 
-	// decide on the serverTime to render
-	CL_SetCGameTime();
+		// see if we need to update any userinfo
+		CL_CheckUserinfo();
+
+		// if we haven't gotten a packet in a long time,
+		// drop the connection
+		CL_CheckTimeout();
+
+		// send intentions now
+		CL_SendCmd();
+
+		// resend a connection request if necessary
+		CL_CheckForResend();
+
+		// decide on the serverTime to render
+		CL_SetCGameTime();
+	}
+	CL_SetLocalClient( 0 );
+
+	// bring split-screen players into the game
+	CL_UpdateLocalClients();
 
 	// update the screen
 	SCR_UpdateScreen();
@@ -3103,6 +3681,8 @@ CL_ShutdownRef
 ============
 */
 void CL_ShutdownRef( void ) {
+	cl_worldMapLoaded = qfalse;
+
 	if ( re.Shutdown ) {
 		re.Shutdown( qtrue );
 	}
@@ -3500,8 +4080,13 @@ void CL_Init( void ) {
 
 	if(!com_fullyInitialized)
 	{
-		CL_ClearState();
-		clc.state = CA_DISCONNECTED;	// no longer CA_UNINITIALIZED
+		int i;
+
+		for ( i = MAX_LOCAL_CLIENTS - 1; i >= 0; i-- ) {
+			CL_SetLocalClient( i );
+			CL_ClearState();
+			clc.state = CA_DISCONNECTED;	// no longer CA_UNINITIALIZED
+		}
 		cl_oldGameSet = qfalse;
 	}
 
@@ -3618,6 +4203,11 @@ void CL_Init( void ) {
 	cl_consoleKeys = Cvar_Get( "cl_consoleKeys", "~ ` 0x7e 0x60", CVAR_ARCHIVE);
 
 	// userinfo
+	// split-screen
+	cl_splitscreen = Cvar_Get ("cl_splitscreen", "1", CVAR_ARCHIVE );
+	cl_splitscreenVertical = Cvar_Get ("cl_splitscreenVertical", "0", CVAR_ARCHIVE );
+	CL_InitLocalClientCvars();
+
 	Cvar_Get ("name", "UnnamedPlayer", CVAR_USERINFO | CVAR_ARCHIVE );
 	cl_rate = Cvar_Get ("rate", "25000", CVAR_USERINFO | CVAR_ARCHIVE );
 	Cvar_Get ("snaps", "20", CVAR_USERINFO | CVAR_ARCHIVE );
@@ -3670,6 +4260,8 @@ void CL_Init( void ) {
 	Cmd_AddCommand ("clientinfo", CL_Clientinfo_f);
 	Cmd_AddCommand ("snd_restart", CL_Snd_Restart_f);
 	Cmd_AddCommand ("vid_restart", CL_Vid_Restart_f);
+	Cmd_AddCommand ("splitscreen", CL_Splitscreen_f);
+	Cmd_AddCommand ("lp", CL_LocalPlayer_f);
 	Cmd_AddCommand ("disconnect", CL_Disconnect_f);
 	Cmd_AddCommand ("record", CL_Record_f);
 	Cmd_AddCommand ("demo", CL_PlayDemo_f);
@@ -3745,6 +4337,8 @@ void CL_Shutdown(char *finalmsg, qboolean disconnect, qboolean quit)
 	Cmd_RemoveCommand ("clientinfo");
 	Cmd_RemoveCommand ("snd_restart");
 	Cmd_RemoveCommand ("vid_restart");
+	Cmd_RemoveCommand ("splitscreen");
+	Cmd_RemoveCommand ("lp");
 	Cmd_RemoveCommand ("disconnect");
 	Cmd_RemoveCommand ("record");
 	Cmd_RemoveCommand ("demo");

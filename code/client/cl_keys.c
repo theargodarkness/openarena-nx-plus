@@ -1178,6 +1178,7 @@ void CL_ParseBinding( int key, qboolean down, unsigned time )
 {
 	char buf[ MAX_STRING_CHARS ], *p = buf, *end;
 	qboolean allCommands, allowUpCmds;
+	int player = CL_EventPlayer();	// split-screen player whose controller this is
 
 	if( clc.state == CA_DISCONNECTED && Key_GetCatcher( ) == 0 )
 		return;
@@ -1207,14 +1208,14 @@ void CL_ParseBinding( int key, qboolean down, unsigned time )
 				char cmd[1024];
 				Com_sprintf( cmd, sizeof( cmd ), "%c%s %d %d\n",
 					( down ) ? '+' : '-', p + 1, key, time );
-				Cbuf_AddText( cmd );
+				CL_AddPlayerCommandText( player, cmd );
 			}
 		}
 		else if( down )
 		{
 			// normal commands only execute on key press
 			if ( allCommands || CL_BindUICommand( p ) ) {
-				Cbuf_AddText( p );
+				CL_AddPlayerCommandText( player, p );
 				Cbuf_AddText( "\n" );
 			}
 		}

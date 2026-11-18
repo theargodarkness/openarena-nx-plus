@@ -287,6 +287,14 @@ rescan:
 	cmd = Cmd_Argv(0);
 	argc = Cmd_Argc();
 
+	if ( !strcmp( cmd, "disconnect" ) && cl_localClient > 0 ) {
+		// An extra split-screen client was dropped. That only takes that
+		// player out, and it has to wait until we are out of its cgame.
+		Com_Printf( "Player %d was disconnected by the server\n", cl_localClient + 1 );
+		cl_dropLocalClient[cl_localClient] = qtrue;
+		return qfalse;
+	}
+
 	if ( !strcmp( cmd, "disconnect" ) ) {
 		// https://zerowing.idsoftware.com/bugzilla/show_bug.cgi?id=552
 		// allow server to indicate why they were disconnected
@@ -394,6 +402,94 @@ void CL_ShutdownCGame( void ) {
 	cgvm = NULL;
 }
 
+/*
+====================
+Split-screen drawing
+
+Each cgame believes it owns the whole screen. Its drawing is squeezed into
+the viewport of its local client on the way to the renderer, so the game
+code needs no changes and players can join or leave without restarting it.
+====================
+*/
+qboolean	cl_worldMapLoaded;
+static char	cl_worldMapName[MAX_QPATH];
+
+static void CL_LoadWorldMap( const char *name ) {
+	// every local client asks for the world; the renderer loads it once
+	if ( cl_worldMapLoaded && !Q_stricmp( name, cl_worldMapName ) ) {
+		return;
+	}
+
+	re.LoadWorld( name );
+	Q_strncpyz( cl_worldMapName, name, sizeof( cl_worldMapName ) );
+	cl_worldMapLoaded = qtrue;
+}
+
+static void CL_DrawStretchPic( float x, float y, float w, float h,
+		float s1, float t1, float s2, float t2, qhandle_t hShader ) {
+	if ( cl_numLocalClients > 1 ) {
+		int		vx, vy, vw, vh;
+		float	sx, sy;
+
+		CL_GetViewport( cl_localClient, &vx, &vy, &vw, &vh );
+		sx = (float)vw / cls.glconfig.vidWidth;
+		sy = (float)vh / cls.glconfig.vidHeight;
+
+		x = vx + x * sx;
+		y = vy + y * sy;
+		w *= sx;
+		h *= sy;
+	}
+
+	re.DrawStretchPic( x, y, w, h, s1, t1, s2, t2, hShader );
+}
+
+static void CL_RenderScene( const refdef_t *fd ) {
+	refdef_t	rd;
+	int			vx, vy, vw, vh;
+	float		sx, sy;
+
+	if ( cl_numLocalClients < 2 ) {
+		re.RenderScene( fd );
+		return;
+	}
+
+	CL_GetViewport( cl_localClient, &vx, &vy, &vw, &vh );
+	sx = (float)vw / cls.glconfig.vidWidth;
+	sy = (float)vh / cls.glconfig.vidHeight;
+
+	rd = *fd;
+	rd.x = vx + (int)( fd->x * sx );
+	rd.y = vy + (int)( fd->y * sy );
+	rd.width = (int)( fd->width * sx );
+	rd.height = (int)( fd->height * sy );
+
+	if ( rd.width < 1 || rd.height < 1 ) {
+		return;
+	}
+
+	// The game picked its field of view for the full screen's shape. Keep
+	// the world view undistorted in the new shape by opening up whichever
+	// axis grew, never by zooming in. HUD models (no world) are left alone
+	// so they stretch exactly like the 2D HUD around them.
+	if ( !( fd->rdflags & RDF_NOWORLDMODEL ) && fd->width > 0 && fd->height > 0 ) {
+		float oldAspect = (float)fd->width / fd->height;
+		float newAspect = (float)rd.width / rd.height;
+
+		if ( newAspect > oldAspect ) {
+			// wider: keep the vertical view, see more to the sides
+			float t = tan( DEG2RAD( fd->fov_y ) * 0.5f ) * newAspect;
+			rd.fov_x = RAD2DEG( atan( t ) ) * 2.0f;
+		} else if ( newAspect < oldAspect ) {
+			// taller: keep the horizontal view, see more up and down
+			float t = tan( DEG2RAD( fd->fov_x ) * 0.5f ) / newAspect;
+			rd.fov_y = RAD2DEG( atan( t ) ) * 2.0f;
+		}
+	}
+
+	re.RenderScene( &rd );
+}
+
 static int	FloatAsInt( float f ) {
 	floatint_t fi;
 	fi.f = f;
@@ -410,7 +506,10 @@ The cgame module is making a system call
 intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 	switch( args[0] ) {
 	case CG_PRINT:
-		Com_Printf( "%s", (const char*)VMA(1) );
+		// every local client is told the same things; print them once
+		if ( cl_localClient == 0 ) {
+			Com_Printf( "%s", (const char*)VMA(1) );
+		}
 		return 0;
 	case CG_ERROR:
 		Com_Error( ERR_DROP, "%s", (const char*)VMA(1) );
@@ -451,7 +550,7 @@ intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 	case CG_FS_SEEK:
 		return FS_Seek( args[1], args[2], args[3] );
 	case CG_SENDCONSOLECOMMAND:
-		Cbuf_AddText( VMA(1) );
+		CL_AddPlayerCommandText( cl_localClient, VMA(1) );
 		return 0;
 	case CG_ADDCOMMAND:
 		CL_AddCgameCommand( VMA(1) );
@@ -463,6 +562,11 @@ intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 		CL_AddReliableCommand(VMA(1), qfalse);
 		return 0;
 	case CG_UPDATESCREEN:
+		// the loading screen belongs to the primary; an extra client
+		// starts up behind the game that is already running
+		if ( cl_localClient > 0 ) {
+			return 0;
+		}
 		// this is used during lengthy level loading, so pump message loop
 //		Com_EventLoop();	// FIXME: if a server restarts here, BAD THINGS HAPPEN!
 // We can't call Com_EventLoop here, a restart will crash and this _does_ happen
@@ -500,36 +604,59 @@ intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 	case CG_CM_MARKFRAGMENTS:
 		return re.MarkFragments( args[1], VMA(2), VMA(3), args[4], VMA(5), args[6], VMA(7) );
 	case CG_S_STARTSOUND:
+		if ( cl_localClient > 0 ) {
+			// There is one listener, the primary. The extra players still
+			// hear their own sounds (weapon, jumps, pain) at full volume;
+			// the rest of the world reaches them through the primary's ears.
+			if ( args[2] == clc.clientNum ) {
+				S_StartLocalSound( args[4], args[3] );
+			}
+			return 0;
+		}
 		S_StartSound( VMA(1), args[2], args[3], args[4] );
 		return 0;
 	case CG_S_STARTLOCALSOUND:
 		S_StartLocalSound( args[1], args[2] );
 		return 0;
 	case CG_S_CLEARLOOPINGSOUNDS:
-		S_ClearLoopingSounds(args[1]);
+		if ( cl_localClient == 0 ) {
+			S_ClearLoopingSounds(args[1]);
+		}
 		return 0;
 	case CG_S_ADDLOOPINGSOUND:
-		S_AddLoopingSound( args[1], VMA(2), VMA(3), args[4] );
+		if ( cl_localClient == 0 ) {
+			S_AddLoopingSound( args[1], VMA(2), VMA(3), args[4] );
+		}
 		return 0;
 	case CG_S_ADDREALLOOPINGSOUND:
-		S_AddRealLoopingSound( args[1], VMA(2), VMA(3), args[4] );
+		if ( cl_localClient == 0 ) {
+			S_AddRealLoopingSound( args[1], VMA(2), VMA(3), args[4] );
+		}
 		return 0;
 	case CG_S_STOPLOOPINGSOUND:
-		S_StopLoopingSound( args[1] );
+		if ( cl_localClient == 0 ) {
+			S_StopLoopingSound( args[1] );
+		}
 		return 0;
 	case CG_S_UPDATEENTITYPOSITION:
-		S_UpdateEntityPosition( args[1], VMA(2) );
+		if ( cl_localClient == 0 ) {
+			S_UpdateEntityPosition( args[1], VMA(2) );
+		}
 		return 0;
 	case CG_S_RESPATIALIZE:
-		S_Respatialize( args[1], VMA(2), VMA(3), args[4] );
+		if ( cl_localClient == 0 ) {
+			S_Respatialize( args[1], VMA(2), VMA(3), args[4] );
+		}
 		return 0;
 	case CG_S_REGISTERSOUND:
 		return S_RegisterSound( VMA(1), args[2] );
 	case CG_S_STARTBACKGROUNDTRACK:
-		S_StartBackgroundTrack( VMA(1), VMA(2) );
+		if ( cl_localClient == 0 ) {
+			S_StartBackgroundTrack( VMA(1), VMA(2) );
+		}
 		return 0;
 	case CG_R_LOADWORLDMAP:
-		re.LoadWorld( VMA(1) );
+		CL_LoadWorldMap( VMA(1) );
 		return 0; 
 	case CG_R_REGISTERMODEL:
 		return re.RegisterModel( VMA(1) );
@@ -563,13 +690,13 @@ intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 		re.AddAdditiveLightToScene( VMA(1), VMF(2), VMF(3), VMF(4), VMF(5) );
 		return 0;
 	case CG_R_RENDERSCENE:
-		re.RenderScene( VMA(1) );
+		CL_RenderScene( VMA(1) );
 		return 0;
 	case CG_R_SETCOLOR:
 		re.SetColor( VMA(1) );
 		return 0;
 	case CG_R_DRAWSTRETCHPIC:
-		re.DrawStretchPic( VMF(1), VMF(2), VMF(3), VMF(4), VMF(5), VMF(6), VMF(7), VMF(8), args[9] );
+		CL_DrawStretchPic( VMF(1), VMF(2), VMF(3), VMF(4), VMF(5), VMF(6), VMF(7), VMF(8), args[9] );
 		return 0;
 	case CG_R_MODELBOUNDS:
 		re.ModelBounds( args[1], VMA(2), VMA(3) );
@@ -647,7 +774,9 @@ intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 		return botlib_export->PC_SourceFileAndLine( args[1], VMA(2), VMA(3) );
 
 	case CG_S_STOPBACKGROUNDTRACK:
-		S_StopBackgroundTrack();
+		if ( cl_localClient == 0 ) {
+			S_StopBackgroundTrack();
+		}
 		return 0;
 
 	case CG_REAL_TIME:
@@ -717,7 +846,9 @@ void CL_InitCGame( void ) {
 	t1 = Sys_Milliseconds();
 
 	// put away the console
-	Con_Close();
+	if ( cl_localClient == 0 ) {
+		Con_Close();
+	}
 
 	// find the current mapname
 	info = cl.gameState.stringData + cl.gameState.stringOffsets[ CS_SERVERINFO ];
@@ -733,7 +864,12 @@ void CL_InitCGame( void ) {
 			interpret = VMI_COMPILED;
 	}
 
-	cgvm = VM_Create( "cgame", CL_CgameSystemCalls, interpret );
+	if ( cl_numLocalClients > 1 || cl_localClient > 0 ) {
+		// split-screen: each local client runs a cgame of its own
+		cgvm = VM_CreateInstance( "cgame", CL_CgameSystemCalls, interpret );
+	} else {
+		cgvm = VM_Create( "cgame", CL_CgameSystemCalls, interpret );
+	}
 	if ( !cgvm ) {
 		Com_Error( ERR_DROP, "VM_Create on cgame failed" );
 	}
@@ -761,7 +897,7 @@ void CL_InitCGame( void ) {
 	re.EndRegistration();
 
 	// make sure everything is paged in
-	if (!Sys_LowPhysicalMemory()) {
+	if (cl_localClient == 0 && !Sys_LowPhysicalMemory()) {
 		Com_TouchMemory();
 	}
 

@@ -183,6 +183,7 @@ const char	*NET_AdrToString (netadr_t a);
 const char	*NET_AdrToStringwPort (netadr_t a);
 int		NET_StringToAdr ( const char *s, netadr_t *a, netadrtype_t family);
 qboolean	NET_GetLoopPacket (netsrc_t sock, netadr_t *net_from, msg_t *net_message);
+void		NET_SetLoopClient( int clientNum );
 void		NET_JoinMulticast6(void);
 void		NET_LeaveMulticast6(void);
 void		NET_Sleep(int msec);
@@ -364,6 +365,8 @@ typedef enum {
 
 void	VM_Init( void );
 vm_t	*VM_Create( const char *module, intptr_t (*systemCalls)(intptr_t *),
+				   vmInterpret_t interpret );
+vm_t	*VM_CreateInstance( const char *module, intptr_t (*systemCalls)(intptr_t *),
 				   vmInterpret_t interpret );
 // module should be bare: "cgame", not "cgame.dll" or "vm/cgame.qvm"
 
@@ -807,6 +810,7 @@ typedef enum {
 	SE_NONE = 0,		// evTime is still valid
 	SE_KEY,			// evValue is a key code, evValue2 is the down flag
 	SE_CHAR,		// evValue is an ascii char
+	SE_PLAYER,		// evValue is the local player (split-screen) the next event belongs to
 	SE_MOUSE,		// evValue and evValue2 are relative signed x / y moves
 	SE_JOYSTICK_AXIS,	// evValue is an axis number and evValue2 is the current state (-127 to 127)
 	SE_CONSOLE		// evPtr is a char*
@@ -984,6 +988,16 @@ CLIENT / SERVER SYSTEMS
 //
 // client interface
 //
+
+// split-screen: how many clients one machine can run at once
+#define	MAX_LOCAL_CLIENTS	4
+
+void CL_PumpLoopback( msg_t *buf );
+// feed pending loopback packets to every local client
+
+void CL_SetEventPlayer( int player );
+// input events are for local player 0 unless an SE_PLAYER event says otherwise
+
 void CL_InitKeyCommands( void );
 // the keyboard binding interface must be setup before execing
 // config files, but the rest of client startup will happen later

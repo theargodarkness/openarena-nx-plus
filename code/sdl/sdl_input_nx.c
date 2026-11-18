@@ -56,6 +56,8 @@ static s32 prev_touchcount=0;
 static cvar_t *in_joystick          = NULL;
 static cvar_t *in_joystickThreshold = NULL;
 static cvar_t *in_joyconStickRotate = NULL; // rotate the stick of a sideways single Joy-Con
+static cvar_t *in_gyroSingleJoyCon  = NULL; // a lone Joy-Con always aims with its gyro
+static cvar_t *in_padJoin           = NULL; // holding L+R / SL+SR on a spare pad adds a split-screen player
 static cvar_t *in_joystickUseAnalog = NULL;
 
 static int vidRestartTime = 0;
@@ -464,15 +466,24 @@ layer. switch-sdl2 only ever exposed player 1 to us, left the last button
 state latched when a pad dropped off, and popped the system controller
 applet by itself whenever a pad changed type. Reading npads directly lets
 us release everything cleanly on disconnect, accept whichever controller
-the player actually picked up, and (later) give every local player a pad.
+the player actually picked up, and give every split-screen player a pad.
+
+Who plays on which pad:
+- One player: every connected pad controls that player, so it never
+  matters which slot Horizon put a controller in.
+- Split-screen: each player owns one pad. A pad nobody owns takes the first
+  free seat when a button is pressed on it. Holding L+R (SL+SR on a
+  sideways Joy-Con) for a second on a pad without a seat adds a player.
 ===========================================================================
 */
 
-#define NX_MAX_PLAYERS   4
+#define NX_MAX_PLAYERS   MAX_LOCAL_CLIENTS
 #define NX_NUM_SLOTS     ( NX_MAX_PLAYERS + 1 )	// No1..No4 + handheld
 #define NX_SLOT_HANDHELD NX_MAX_PLAYERS
 #define NX_NUM_BUTTONS   15						// SDL_CONTROLLER_BUTTON_A..DPAD_RIGHT
 #define NX_NUM_AXES      6						// SDL_CONTROLLER_AXIS_LEFTX..TRIGGERRIGHT
+#define NX_JOIN_HOLD_MSEC    1000
+#define NX_JOIN_TIMEOUT_MSEC 3000
 
 typedef struct
 {
@@ -481,17 +492,32 @@ typedef struct
 	u32 style;								// active HidNpadStyleTag, 0 = not connected
 	HidSixAxisSensorHandle sixaxis[2];
 	int numSixaxis;
+
+	int player;								// split-screen player who owns this pad, -1 = nobody
+	qboolean buttons[NX_NUM_BUTTONS];		// this frame, in SDL controller layout
+	int axes[NX_NUM_AXES];
+	qboolean active;						// produced input this frame
+	qboolean anyButton;
+	qboolean joinHeld;						// L+R / SL+SR are down
+	int joinHoldStart;
 } nxPad_t;
 
-static nxPad_t nx_pads[NX_NUM_SLOTS];
-static qboolean nx_padsInitialized = qfalse;
-static int nx_activeSlot = -1;				// pad that last produced input; its gyro is the one we use
-
-struct
+typedef struct
 {
-	qboolean buttons[NX_NUM_BUTTONS];
+	qboolean buttons[NX_NUM_BUTTONS];		// last state sent to the game
 	int oldaaxes[MAX_JOYSTICK_AXIS];
-} stick_state;
+	int gyroSlot;							// pad whose motion sensor aims for this player, -1 = none
+	float gyroRemX, gyroRemY;
+} nxPlayer_t;
+
+static nxPad_t nx_pads[NX_NUM_SLOTS];
+static nxPlayer_t nx_players[NX_MAX_PLAYERS];
+static qboolean nx_menuButtons[NX_NUM_BUTTONS];	// last merged state used for menu navigation
+static qboolean nx_padsInitialized = qfalse;
+static qboolean nx_splitWasOn = qfalse;
+static int nx_homeSlot = -1;				// pad the first player was last seen using
+static int nx_pendingJoinSlot = -1;			// pad that asked for a new player to be added
+static int nx_pendingJoinTime = 0;
 
 // Indexed by SDL_CONTROLLER_BUTTON_*, which is what K_PAD0_A + i and the
 // existing binds expect. This reproduces the switch-sdl2 layout the port has
@@ -505,12 +531,13 @@ static const u64 nx_buttonsFull[NX_NUM_BUTTONS] = {
 };
 
 // Single Joy-Con held sideways: face buttons keep their positions (bottom
-// button is still the "A" slot), stick click is start, SL/SR are the triggers.
+// button is still the "A" slot), stick click is start, SL/SR are the
+// triggers, and the two buttons on the end are the shoulders.
 static const u64 nx_buttonsJoyLeft[NX_NUM_BUTTONS] = {
 	HidNpadButton_Left, HidNpadButton_Down, HidNpadButton_Up, HidNpadButton_Right,
 	HidNpadButton_Minus, 0, HidNpadButton_StickL,
 	0, 0,
-	0, 0,
+	HidNpadButton_L, HidNpadButton_ZL,
 	0, 0, 0, 0
 };
 
@@ -518,7 +545,7 @@ static const u64 nx_buttonsJoyRight[NX_NUM_BUTTONS] = {
 	HidNpadButton_A, HidNpadButton_X, HidNpadButton_B, HidNpadButton_Y,
 	HidNpadButton_Plus, 0, HidNpadButton_StickR,
 	0, 0,
-	0, 0,
+	HidNpadButton_R, HidNpadButton_ZR,
 	0, 0, 0, 0
 };
 
@@ -533,6 +560,11 @@ static const char *IN_NXStyleName( u32 style )
 		case HidNpadStyleTag_NpadJoyRight: return "single Joy-Con (R)";
 		default:                           return "unknown";
 	}
+}
+
+static qboolean IN_NXIsSingleJoyCon( u32 style )
+{
+	return style == HidNpadStyleTag_NpadJoyLeft || style == HidNpadStyleTag_NpadJoyRight;
 }
 
 static u32 IN_NXPrimaryStyle( u32 styleSet )
@@ -577,6 +609,7 @@ static void IN_NXPadChanged( nxPad_t *p, int slot, u32 style )
 		Com_Printf( "Controller %d: disconnected\n", slot + 1 );
 
 	p->style = style;
+	p->joinHoldStart = 0;
 	if( !style )
 		return;
 
@@ -604,12 +637,14 @@ Translate one pad into the SDL-style button/axis layout the rest of the
 input code works with. Y axes are positive-down, like SDL.
 ===============
 */
-static void IN_NXReadPad( nxPad_t *p, qboolean *buttons, int *axes )
+static void IN_NXReadPad( nxPad_t *p )
 {
 	const u64 *map = nx_buttonsFull;
 	u64 down = padGetButtons( &p->pad );
 	HidAnalogStickState l = padGetStickPos( &p->pad, 0 );
 	HidAnalogStickState r = padGetStickPos( &p->pad, 1 );
+	qboolean *buttons = p->buttons;
+	int *axes = p->axes;
 	int i;
 
 	if( p->style == HidNpadStyleTag_NpadJoyLeft )
@@ -625,6 +660,7 @@ static void IN_NXReadPad( nxPad_t *p, qboolean *buttons, int *axes )
 		r.x = r.y = 0;
 		axes[SDL_CONTROLLER_AXIS_TRIGGERLEFT]  = ( down & HidNpadButton_LeftSL ) ? 32767 : 0;
 		axes[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] = ( down & HidNpadButton_LeftSR ) ? 32767 : 0;
+		p->joinHeld = ( down & HidNpadButton_LeftSL ) && ( down & HidNpadButton_LeftSR );
 	}
 	else if( p->style == HidNpadStyleTag_NpadJoyRight )
 	{
@@ -641,49 +677,59 @@ static void IN_NXReadPad( nxPad_t *p, qboolean *buttons, int *axes )
 		r.x = r.y = 0;
 		axes[SDL_CONTROLLER_AXIS_TRIGGERLEFT]  = ( down & HidNpadButton_RightSL ) ? 32767 : 0;
 		axes[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] = ( down & HidNpadButton_RightSR ) ? 32767 : 0;
+		p->joinHeld = ( down & HidNpadButton_RightSL ) && ( down & HidNpadButton_RightSR );
 	}
 	else
 	{
 		axes[SDL_CONTROLLER_AXIS_TRIGGERLEFT]  = ( down & HidNpadButton_ZL ) ? 32767 : 0;
 		axes[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] = ( down & HidNpadButton_ZR ) ? 32767 : 0;
+		p->joinHeld = ( down & HidNpadButton_L ) && ( down & HidNpadButton_R );
 	}
 
 	for( i = 0; i < NX_NUM_BUTTONS; i++ )
+	{
 		buttons[i] = ( map[i] && ( down & map[i] ) ) ? qtrue : qfalse;
+		if( buttons[i] )
+			p->anyButton = qtrue;
+	}
 
 	axes[SDL_CONTROLLER_AXIS_LEFTX]  = IN_NXClampAxis( l.x );
 	axes[SDL_CONTROLLER_AXIS_LEFTY]  = IN_NXClampAxis( -l.y );
 	axes[SDL_CONTROLLER_AXIS_RIGHTX] = IN_NXClampAxis( r.x );
 	axes[SDL_CONTROLLER_AXIS_RIGHTY] = IN_NXClampAxis( -r.y );
+
+	if( axes[SDL_CONTROLLER_AXIS_TRIGGERLEFT] || axes[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] )
+		p->anyButton = qtrue;
+
+	p->active = p->anyButton;
+	for( i = 0; i < 4; i++ )
+	{
+		if( abs( axes[i] ) > 16384 )
+			p->active = qtrue;
+	}
 }
 
 /*
 ===============
 IN_NXPollPads
 
-Read every pad and merge them into one logical controller, so it doesn't
-matter which player slot Horizon put the controller in. With nothing
-connected (or in_joystick 0) everything reads as released, which makes the
-caller send key-ups instead of leaving buttons latched.
+Read the current state of every pad. A pad that is not connected (or
+in_joystick 0) reads as fully released, which is what makes held buttons
+let go instead of staying latched.
 ===============
 */
-static void IN_NXPollPads( qboolean *buttons, int *axes )
+static void IN_NXPollPads( void )
 {
-	int slot, i;
-
-	memset( buttons, 0, sizeof( qboolean ) * NX_NUM_BUTTONS );
-	memset( axes, 0, sizeof( int ) * NX_NUM_AXES );
-
-	if( !nx_padsInitialized )
-		return;
+	int slot;
 
 	for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
 	{
 		nxPad_t *p = &nx_pads[slot];
-		qboolean padButtons[NX_NUM_BUTTONS];
-		int padAxes[NX_NUM_AXES];
-		qboolean active = qfalse;
 		u32 style;
+
+		memset( p->buttons, 0, sizeof( p->buttons ) );
+		memset( p->axes, 0, sizeof( p->axes ) );
+		p->active = p->anyButton = p->joinHeld = qfalse;
 
 		padUpdate( &p->pad );
 		style = padIsConnected( &p->pad ) ? IN_NXPrimaryStyle( padGetStyleSet( &p->pad ) ) : 0;
@@ -691,42 +737,277 @@ static void IN_NXPollPads( qboolean *buttons, int *axes )
 		if( style != p->style )
 			IN_NXPadChanged( p, slot, style );
 
-		if( !style || !in_joystick->integer )
+		if( style && in_joystick->integer )
+			IN_NXReadPad( p );
+
+		if( !p->joinHeld )
+			p->joinHoldStart = 0;
+	}
+}
+
+/*
+===============
+IN_NXSeatTaken
+
+True if a connected pad already plays as this player
+===============
+*/
+static qboolean IN_NXSeatTaken( int player )
+{
+	int slot;
+
+	for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
+	{
+		if( nx_pads[slot].style && nx_pads[slot].player == player )
+			return qtrue;
+	}
+	return qfalse;
+}
+
+static void IN_NXClaimSeat( int slot, int player )
+{
+	int i;
+
+	// a pad that went away may still be holding the seat
+	for( i = 0; i < NX_NUM_SLOTS; i++ )
+	{
+		if( nx_pads[i].player == player )
+			nx_pads[i].player = -1;
+	}
+
+	nx_pads[slot].player = player;
+	nx_players[player].gyroSlot = slot;
+	Com_Printf( "Player %d is using %s\n", player + 1,
+		slot == NX_SLOT_HANDHELD ? "the attached Joy-Cons" : va( "controller %d", slot + 1 ) );
+}
+
+/*
+===============
+IN_NXJoinHeld
+
+True once the join buttons have been held long enough on this pad
+===============
+*/
+static qboolean IN_NXJoinHeld( nxPad_t *p, int now )
+{
+	if( !p->joinHeld )
+		return qfalse;
+
+	if( !p->joinHoldStart )
+	{
+		p->joinHoldStart = now ? now : 1;
+		return qfalse;
+	}
+
+	if( now - p->joinHoldStart < NX_JOIN_HOLD_MSEC )
+		return qfalse;
+
+	p->joinHoldStart = 0;
+	return qtrue;
+}
+
+/*
+===============
+IN_NXAssignPads
+
+Decide which pad plays as which split-screen player (see the top of this
+section for the rules)
+===============
+*/
+static void IN_NXAssignPads( void )
+{
+	int numPlayers = cl_numLocalClients;
+	qboolean split = ( numPlayers > 1 );
+	qboolean canJoin;
+	int now = Sys_Milliseconds( );
+	int slot, player;
+
+	// players can only be added to a game we are hosting and playing right now
+	canJoin = in_padJoin->integer && com_sv_running->integer && numPlayers < NX_MAX_PLAYERS
+		&& CL_LocalClientState( 0 ) == CA_ACTIVE && Key_GetCatcher( ) == 0
+		&& nx_pendingJoinSlot < 0;
+
+	if( nx_pendingJoinSlot >= 0 && now - nx_pendingJoinTime > NX_JOIN_TIMEOUT_MSEC )
+		nx_pendingJoinSlot = -1;
+
+	if( !split )
+	{
+		if( nx_splitWasOn )
+		{
+			for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
+				nx_pads[slot].player = -1;
+		}
+		nx_splitWasOn = qfalse;
+
+		// remember which pad the player is really using; a pad asking to
+		// join doesn't count
+		for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
+		{
+			if( nx_pads[slot].active && !nx_pads[slot].joinHeld )
+				nx_homeSlot = slot;
+		}
+		if( nx_homeSlot >= 0 && !nx_pads[nx_homeSlot].style )
+			nx_homeSlot = -1;
+
+		for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
+		{
+			nxPad_t *p = &nx_pads[slot];
+
+			if( !p->style || slot == nx_homeSlot || nx_homeSlot < 0 )
+			{
+				p->joinHoldStart = 0;
+				continue;
+			}
+
+			if( canJoin && IN_NXJoinHeld( p, now ) )
+			{
+				nx_pendingJoinSlot = slot;
+				nx_pendingJoinTime = now;
+				Cbuf_AddText( "splitscreen 2\n" );
+				break;
+			}
+		}
+		return;
+	}
+
+	// split-screen is on
+	for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
+	{
+		if( nx_pads[slot].player >= numPlayers )
+			nx_pads[slot].player = -1;
+	}
+
+	if( !nx_splitWasOn )
+	{
+		// the first player keeps the pad they were playing on
+		nx_splitWasOn = qtrue;
+		for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
+			nx_pads[slot].player = -1;
+		if( nx_homeSlot >= 0 && nx_pads[nx_homeSlot].style && nx_homeSlot != nx_pendingJoinSlot )
+			IN_NXClaimSeat( nx_homeSlot, 0 );
+	}
+
+	// the pad that asked for the new player gets the new seat
+	if( nx_pendingJoinSlot >= 0 )
+	{
+		nxPad_t *p = &nx_pads[nx_pendingJoinSlot];
+
+		if( p->style && p->player < 0 )
+		{
+			for( player = numPlayers - 1; player >= 0; player-- )
+			{
+				if( !IN_NXSeatTaken( player ) )
+				{
+					IN_NXClaimSeat( nx_pendingJoinSlot, player );
+					nx_pendingJoinSlot = -1;
+					break;
+				}
+			}
+		}
+		else
+		{
+			nx_pendingJoinSlot = -1;
+		}
+	}
+
+	for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
+	{
+		nxPad_t *p = &nx_pads[slot];
+
+		if( !p->style || p->player >= 0 || slot == nx_pendingJoinSlot )
 			continue;
 
-		IN_NXReadPad( p, padButtons, padAxes );
+		// any button takes the first free seat
+		if( p->anyButton )
+		{
+			for( player = 0; player < numPlayers; player++ )
+			{
+				if( !IN_NXSeatTaken( player ) )
+				{
+					IN_NXClaimSeat( slot, player );
+					break;
+				}
+			}
+			if( p->player >= 0 )
+				continue;
+		}
+
+		// every seat is taken: holding the join buttons adds a player
+		if( canJoin && IN_NXJoinHeld( p, now ) )
+		{
+			nx_pendingJoinSlot = slot;
+			nx_pendingJoinTime = now;
+			Cbuf_AddText( va( "splitscreen %d\n", numPlayers + 1 ) );
+			canJoin = qfalse;
+		}
+	}
+}
+
+/*
+===============
+IN_NXPlayerState
+
+Merge the pads that belong to one player. With split-screen off every pad
+belongs to the only player.
+===============
+*/
+static void IN_NXPlayerState( int player, qboolean *buttons, int *axes )
+{
+	qboolean split = ( cl_numLocalClients > 1 );
+	nxPlayer_t *pl = &nx_players[player];
+	int slot, i;
+
+	memset( buttons, 0, sizeof( qboolean ) * NX_NUM_BUTTONS );
+	memset( axes, 0, sizeof( int ) * NX_NUM_AXES );
+
+	for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
+	{
+		nxPad_t *p = &nx_pads[slot];
+
+		if( !p->style )
+			continue;
+		if( split ? ( p->player != player ) : ( player != 0 ) )
+			continue;
 
 		for( i = 0; i < NX_NUM_BUTTONS; i++ )
 		{
-			if( padButtons[i] )
-			{
+			if( p->buttons[i] )
 				buttons[i] = qtrue;
-				active = qtrue;
-			}
 		}
-
 		for( i = 0; i < NX_NUM_AXES; i++ )
 		{
-			if( abs( padAxes[i] ) > abs( axes[i] ) )
-				axes[i] = padAxes[i];
-			if( abs( padAxes[i] ) > 16384 )
-				active = qtrue;
+			if( abs( p->axes[i] ) > abs( axes[i] ) )
+				axes[i] = p->axes[i];
 		}
 
-		if( active )
-			nx_activeSlot = slot;
+		// gyro follows the pad in use
+		if( p->active || pl->gyroSlot < 0 || !nx_pads[pl->gyroSlot].style
+			|| ( split && nx_pads[pl->gyroSlot].player != player ) )
+			pl->gyroSlot = slot;
 	}
 
-	// gyro follows the pad in use; fall back to any connected pad
-	if( nx_activeSlot < 0 || !nx_pads[nx_activeSlot].style )
+	if( pl->gyroSlot >= 0 )
 	{
-		nx_activeSlot = -1;
-		for( slot = NX_NUM_SLOTS - 1; slot >= 0; slot-- )
-		{
-			if( nx_pads[slot].style )
-				nx_activeSlot = slot;
-		}
+		nxPad_t *g = &nx_pads[pl->gyroSlot];
+
+		if( !g->style || ( split && g->player != player ) )
+			pl->gyroSlot = -1;
 	}
+}
+
+/*
+===============
+IN_QueuePlayerEvent
+
+Queue an input event for a split-screen player. Events are for the first
+player unless an SE_PLAYER event comes right before them.
+===============
+*/
+static void IN_QueuePlayerEvent( int player, sysEventType_t type, int value, int value2 )
+{
+	if( player > 0 )
+		Com_QueueEvent( in_eventTime, SE_PLAYER, player, 0, 0, NULL );
+	Com_QueueEvent( in_eventTime, type, value, value2, 0, NULL );
 }
 
 /*
@@ -747,17 +1028,24 @@ static void IN_InitPads( void )
 		return;
 
 	memset( nx_pads, 0, sizeof( nx_pads ) );
-	memset( &stick_state, 0, sizeof( stick_state ) );
+	memset( nx_players, 0, sizeof( nx_players ) );
+	memset( nx_menuButtons, 0, sizeof( nx_menuButtons ) );
 
 	for( i = 0; i < NX_MAX_PLAYERS; i++ )
 	{
 		nx_pads[i].id = (HidNpadIdType)( HidNpadIdType_No1 + i );
 		padInitialize( &nx_pads[i].pad, nx_pads[i].id );
+		nx_players[i].gyroSlot = -1;
 	}
 	nx_pads[NX_SLOT_HANDHELD].id = HidNpadIdType_Handheld;
 	padInitialize( &nx_pads[NX_SLOT_HANDHELD].pad, HidNpadIdType_Handheld );
 
-	nx_activeSlot = -1;
+	for( i = 0; i < NX_NUM_SLOTS; i++ )
+		nx_pads[i].player = -1;
+
+	nx_homeSlot = -1;
+	nx_pendingJoinSlot = -1;
+	nx_splitWasOn = qfalse;
 	nx_padsInitialized = qtrue;
 }
 
@@ -884,27 +1172,27 @@ static qboolean KeyToAxisAndSign(int keynum, int *outAxis, int *outSign)
 /*
 ===============
 IN_GamepadMove
+
+Send one player's buttons and sticks to the game
 ===============
 */
-static void IN_GamepadMove( void )
+static void IN_GamepadMove( int player, const qboolean *nxButtons, const int *nxAxes, qboolean *changed )
 {
+	nxPlayer_t *pl = &nx_players[player];
 	int i;
 	int translatedAxes[MAX_JOYSTICK_AXIS];
 	qboolean translatedAxesSet[MAX_JOYSTICK_AXIS];
-	qboolean changed[NX_NUM_BUTTONS] = { qfalse };
-	qboolean nxButtons[NX_NUM_BUTTONS];
-	int nxAxes[NX_NUM_AXES];
-
-	IN_NXPollPads( nxButtons, nxAxes );
 
 	// check buttons
 	for (i = 0; i < NX_NUM_BUTTONS; i++)
 	{
 		qboolean pressed = nxButtons[i];
-		if (pressed != stick_state.buttons[i])
+
+		changed[i] = qfalse;
+		if (pressed != pl->buttons[i])
 		{
-			Com_QueueEvent(in_eventTime, SE_KEY, K_PAD0_A + i, pressed, 0, NULL);
-			stick_state.buttons[i] = pressed;
+			IN_QueuePlayerEvent(player, SE_KEY, K_PAD0_A + i, pressed);
+			pl->buttons[i] = pressed;
 			changed[i] = qtrue;
 		}
 	}
@@ -924,7 +1212,7 @@ static void IN_GamepadMove( void )
 	for (i = 0; i < NX_NUM_AXES; i++)
 	{
 		int axis = nxAxes[i];
-		int oldAxis = stick_state.oldaaxes[i];
+		int oldAxis = pl->oldaaxes[i];
 
 		// Smoothly ramp from dead zone to maximum value
 		float f = ((float)abs(axis) / 32767.0f - in_joystickThreshold->value) / (1.0f - in_joystickThreshold->value);
@@ -984,21 +1272,21 @@ static void IN_GamepadMove( void )
 
 			// positive to negative/neutral -> keyup
 			if (!posAnalog && posKey && oldAxis > 0 && axis <= 0)
-				Com_QueueEvent(in_eventTime, SE_KEY, posKey, qfalse, 0, NULL);
+				IN_QueuePlayerEvent(player, SE_KEY, posKey, qfalse);
 
 			// negative to positive/neutral -> keyup
 			if (!negAnalog && negKey && oldAxis < 0 && axis >= 0)
-				Com_QueueEvent(in_eventTime, SE_KEY, negKey, qfalse, 0, NULL);
+				IN_QueuePlayerEvent(player, SE_KEY, negKey, qfalse);
 
 			// negative/neutral to positive -> keydown
 			if (!posAnalog && posKey && oldAxis <= 0 && axis > 0)
-				Com_QueueEvent(in_eventTime, SE_KEY, posKey, qtrue, 0, NULL);
+				IN_QueuePlayerEvent(player, SE_KEY, posKey, qtrue);
 
 			// positive/neutral to negative -> keydown
 			if (!negAnalog && negKey && oldAxis >= 0 && axis < 0)
-				Com_QueueEvent(in_eventTime, SE_KEY, negKey, qtrue, 0, NULL);
+				IN_QueuePlayerEvent(player, SE_KEY, negKey, qtrue);
 
-			stick_state.oldaaxes[i] = axis;
+			pl->oldaaxes[i] = axis;
 		}
 	}
 
@@ -1008,16 +1296,62 @@ static void IN_GamepadMove( void )
 		for (i = 0; i < MAX_JOYSTICK_AXIS; i++)
 		{
 			if (translatedAxesSet[i])
-				Com_QueueEvent(in_eventTime, SE_JOYSTICK_AXIS, i, translatedAxes[i], 0, NULL);
+				IN_QueuePlayerEvent(player, SE_JOYSTICK_AXIS, i, translatedAxes[i]);
 		}
+	}
+}
+
+/*
+===============
+IN_MenuMove
+
+Menus and the console are shared, so any pad can drive them: this turns
+the merged state of all pads into mouse movement, clicks and arrow keys.
+In-game it only watches the first player's d-pad for the console.
+===============
+*/
+static void IN_MenuMove( const qboolean *playerChanged )
+{
+	qboolean buttons[NX_NUM_BUTTONS] = { qfalse };
+	qboolean changed[NX_NUM_BUTTONS];
+	int mousedx = 0, mousedy = 0;
+	int slot, i;
+
+	for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
+	{
+		nxPad_t *p = &nx_pads[slot];
+
+		if( !p->style )
+			continue;
+
+		for( i = 0; i < NX_NUM_BUTTONS; i++ )
+		{
+			if( p->buttons[i] )
+				buttons[i] = qtrue;
+		}
+		if( abs( p->axes[0] ) > abs( mousedx ) )
+			mousedx = p->axes[0];
+		if( abs( p->axes[1] ) > abs( mousedy ) )
+			mousedy = p->axes[1];
+	}
+
+	for( i = 0; i < NX_NUM_BUTTONS; i++ )
+	{
+		changed[i] = ( buttons[i] != nx_menuButtons[i] );
+		nx_menuButtons[i] = buttons[i];
 	}
 
 	// HACK: in menus, also generate mouse events from some of the buttons and left analog
 	//       also translate dpad presses into arrow keys because UI progs don't recognize them
 	if (clc.state == CA_DISCONNECTED || clc.state == CA_CINEMATIC || ( Key_GetCatcher( ) & KEYCATCH_UI ))
 	{
-		int mousedx = stick_state.oldaaxes[0];
-		int mousedy = stick_state.oldaaxes[1];
+		// same dead zone ramp the game axes get
+		float t = in_joystickThreshold->value;
+		float fx = ( (float)abs( mousedx ) / 32767.0f - t ) / ( 1.0f - t );
+		float fy = ( (float)abs( mousedy ) / 32767.0f - t ) / ( 1.0f - t );
+
+		mousedx = ( fx > 0.0f ) ? (int)( 32767 * ( mousedx < 0 ? -fx : fx ) ) : 0;
+		mousedy = ( fy > 0.0f ) ? (int)( 32767 * ( mousedy < 0 ? -fy : fy ) ) : 0;
 
 		if (abs(mousedx) > 32 || abs(mousedy) > 32)
 			Com_QueueEvent( in_eventTime, SE_MOUSE, mousedx / 4096, mousedy / 4096, 0, NULL );
@@ -1025,60 +1359,102 @@ static void IN_GamepadMove( void )
 		// NOTE: A-B and X-Y are swapped in switch-sdl2, so keep this in mind when reading this code
 		// A and B act as mouse clicks, X as enter (in case you want to control the menu using the d-pad)
 		if (changed[SDL_CONTROLLER_BUTTON_A])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_MOUSE2, stick_state.buttons[SDL_CONTROLLER_BUTTON_A], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_MOUSE2, buttons[SDL_CONTROLLER_BUTTON_A], 0, NULL );
 		if (changed[SDL_CONTROLLER_BUTTON_B])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_MOUSE1, stick_state.buttons[SDL_CONTROLLER_BUTTON_B], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_MOUSE1, buttons[SDL_CONTROLLER_BUTTON_B], 0, NULL );
 		if (changed[SDL_CONTROLLER_BUTTON_Y])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_ENTER, stick_state.buttons[SDL_CONTROLLER_BUTTON_Y], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_ENTER, buttons[SDL_CONTROLLER_BUTTON_Y], 0, NULL );
 
 		// Y to bring up console
 		if (changed[SDL_CONTROLLER_BUTTON_X])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_CONSOLE, stick_state.buttons[SDL_CONTROLLER_BUTTON_X], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_CONSOLE, buttons[SDL_CONTROLLER_BUTTON_X], 0, NULL );
 
 		// show OSK if L is pressed in a menu
-		if (changed[SDL_CONTROLLER_BUTTON_LEFTSHOULDER] && stick_state.buttons[SDL_CONTROLLER_BUTTON_LEFTSHOULDER])
+		if (changed[SDL_CONTROLLER_BUTTON_LEFTSHOULDER] && buttons[SDL_CONTROLLER_BUTTON_LEFTSHOULDER])
 			IN_ShowOSK_f( );
 		// use R to delete characters in menu fields
-		if (changed[SDL_CONTROLLER_BUTTON_RIGHTSHOULDER] && stick_state.buttons[SDL_CONTROLLER_BUTTON_RIGHTSHOULDER])
+		if (changed[SDL_CONTROLLER_BUTTON_RIGHTSHOULDER] && buttons[SDL_CONTROLLER_BUTTON_RIGHTSHOULDER])
 			Com_QueueEvent( in_eventTime, SE_CHAR, CTRL('h'), 0, 0, NULL );
 		// use dpad to control menu cursor
 		if (changed[SDL_CONTROLLER_BUTTON_DPAD_UP])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_UPARROW, stick_state.buttons[SDL_CONTROLLER_BUTTON_DPAD_UP], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_UPARROW, buttons[SDL_CONTROLLER_BUTTON_DPAD_UP], 0, NULL );
 		if (changed[SDL_CONTROLLER_BUTTON_DPAD_DOWN])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_DOWNARROW, stick_state.buttons[SDL_CONTROLLER_BUTTON_DPAD_DOWN], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_DOWNARROW, buttons[SDL_CONTROLLER_BUTTON_DPAD_DOWN], 0, NULL );
 		if (changed[SDL_CONTROLLER_BUTTON_DPAD_LEFT])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_LEFTARROW, stick_state.buttons[SDL_CONTROLLER_BUTTON_DPAD_LEFT], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_LEFTARROW, buttons[SDL_CONTROLLER_BUTTON_DPAD_LEFT], 0, NULL );
 		if (changed[SDL_CONTROLLER_BUTTON_DPAD_RIGHT])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_RIGHTARROW, stick_state.buttons[SDL_CONTROLLER_BUTTON_DPAD_RIGHT], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_RIGHTARROW, buttons[SDL_CONTROLLER_BUTTON_DPAD_RIGHT], 0, NULL );
 	}
 	else
 	{
 		// In-game, dpad down to open console
-		if (changed[SDL_CONTROLLER_BUTTON_DPAD_DOWN])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_CONSOLE, stick_state.buttons[SDL_CONTROLLER_BUTTON_DPAD_DOWN], 0, NULL );
+		if (playerChanged[SDL_CONTROLLER_BUTTON_DPAD_DOWN])
+			Com_QueueEvent( in_eventTime, SE_KEY, K_CONSOLE, nx_players[0].buttons[SDL_CONTROLLER_BUTTON_DPAD_DOWN], 0, NULL );
 	}
 
 	if (Key_GetCatcher( ) & KEYCATCH_CONSOLE)
 	{
 		// in console: L to show OSK, R to delete
-		if (changed[SDL_CONTROLLER_BUTTON_LEFTSHOULDER] && stick_state.buttons[SDL_CONTROLLER_BUTTON_LEFTSHOULDER])
+		if (changed[SDL_CONTROLLER_BUTTON_LEFTSHOULDER] && buttons[SDL_CONTROLLER_BUTTON_LEFTSHOULDER])
 			IN_ShowOSK_f( );
 		if (changed[SDL_CONTROLLER_BUTTON_RIGHTSHOULDER])
 			Com_QueueEvent( in_eventTime, SE_CHAR, CTRL('h'), 0, 0, NULL );
 		// A to enter
 		if (changed[SDL_CONTROLLER_BUTTON_B])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_ENTER, stick_state.buttons[SDL_CONTROLLER_BUTTON_B], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_ENTER, buttons[SDL_CONTROLLER_BUTTON_B], 0, NULL );
 		// dpad up to scroll through commands
 		if (changed[SDL_CONTROLLER_BUTTON_DPAD_UP])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_UPARROW, stick_state.buttons[SDL_CONTROLLER_BUTTON_DPAD_UP], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_UPARROW, buttons[SDL_CONTROLLER_BUTTON_DPAD_UP], 0, NULL );
 		// left/right to scroll console log
 		if (changed[SDL_CONTROLLER_BUTTON_DPAD_LEFT])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_PGUP, stick_state.buttons[SDL_CONTROLLER_BUTTON_DPAD_LEFT], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_PGUP, buttons[SDL_CONTROLLER_BUTTON_DPAD_LEFT], 0, NULL );
 		if (changed[SDL_CONTROLLER_BUTTON_DPAD_RIGHT])
-			Com_QueueEvent( in_eventTime, SE_KEY, K_PGDN, stick_state.buttons[SDL_CONTROLLER_BUTTON_DPAD_RIGHT], 0, NULL );
+			Com_QueueEvent( in_eventTime, SE_KEY, K_PGDN, buttons[SDL_CONTROLLER_BUTTON_DPAD_RIGHT], 0, NULL );
 	}
 }
 
+/*
+===============
+IN_PadFrame
+
+Everything the controllers do in one frame
+===============
+*/
+static void IN_PadFrame( void )
+{
+	qboolean buttons[NX_NUM_BUTTONS];
+	qboolean changed[NX_NUM_BUTTONS];
+	qboolean firstChanged[NX_NUM_BUTTONS] = { qfalse };
+	int axes[NX_NUM_AXES];
+	int player;
+
+	if( !nx_padsInitialized )
+		return;
+
+	IN_NXPollPads( );
+	IN_NXAssignPads( );
+
+	for( player = 0; player < NX_MAX_PLAYERS; player++ )
+	{
+		if( player >= cl_numLocalClients )
+		{
+			// nobody plays here; forget what was held so nothing is
+			// replayed if the seat is filled again
+			memset( nx_players[player].buttons, 0, sizeof( nx_players[player].buttons ) );
+			memset( nx_players[player].oldaaxes, 0, sizeof( nx_players[player].oldaaxes ) );
+			nx_players[player].gyroSlot = -1;
+			continue;
+		}
+
+		IN_NXPlayerState( player, buttons, axes );
+		IN_GamepadMove( player, buttons, axes, changed );
+
+		if( player == 0 )
+			memcpy( firstChanged, changed, sizeof( firstChanged ) );
+	}
+
+	IN_MenuMove( firstChanged );
+}
 
 /*
 ===============
@@ -1279,28 +1655,43 @@ static void IN_ProcessEvents( void )
 ===============
 IN_ProcessGyro
 
-Gyro aiming from the pad currently in use. Angular velocity is integrated
-over the real frame time, so sensitivity no longer changes with framerate
-(the scale is 1.0 at 60 fps, which keeps existing sensitivity settings).
+Gyro aiming for one player, from the pad that player is using. Angular
+velocity is integrated over the real frame time, so sensitivity does not
+change with framerate (the scale is 1.0 at 60 fps, which keeps existing
+sensitivity settings). A lone Joy-Con has no second stick, so its gyro is
+always on unless in_gyroSingleJoyCon is 0.
 ===============
 */
-static void IN_ProcessGyro( int frameMsec )
+static void IN_ProcessGyro( int player, int frameMsec )
 {
-	static float remX = 0.0f, remY = 0.0f;
+	nxPlayer_t *pl = &nx_players[player];
 	HidSixAxisSensorState sixaxis;
 	HidSixAxisSensorHandle handle;
 	nxPad_t *p;
+	qboolean inMenu;
 	float pitch, yaw, scale, fx, fy;
 	int ix, iy, yawAxis;
 
-	if( !in_gyromouse->integer || nx_activeSlot < 0 )
+	if( pl->gyroSlot < 0 )
 	{
-		remX = remY = 0.0f;
+		pl->gyroRemX = pl->gyroRemY = 0.0f;
 		return;
 	}
 
-	p = &nx_pads[nx_activeSlot];
+	p = &nx_pads[pl->gyroSlot];
 	if( !p->style || !p->numSixaxis )
+		return;
+
+	if( !in_gyromouse->integer && !( IN_NXIsSingleJoyCon( p->style ) && in_gyroSingleJoyCon->integer ) )
+	{
+		pl->gyroRemX = pl->gyroRemY = 0.0f;
+		return;
+	}
+
+	inMenu = ( clc.state == CA_DISCONNECTED || clc.state == CA_CINEMATIC || ( Key_GetCatcher( ) & KEYCATCH_UI ) );
+
+	// only the first player moves the menu cursor
+	if( player > 0 && ( inMenu || Key_GetCatcher( ) ) )
 		return;
 
 	// on a Joy-Con pair, aim with the right one if it is there
@@ -1313,7 +1704,7 @@ static void IN_ProcessGyro( int frameMsec )
 		return;
 
 	if ( in_gyromouse_debug->integer ) {
-		Com_Printf("Pad slot %d (%s)\n", nx_activeSlot, IN_NXStyleName( p->style ));
+		Com_Printf("Player %d, pad slot %d (%s)\n", player + 1, pl->gyroSlot, IN_NXStyleName( p->style ));
 		Com_Printf("Acceleration:     x=% .4f, y=% .4f, z=% .4f\n", sixaxis.acceleration.x, sixaxis.acceleration.y, sixaxis.acceleration.z);
 		Com_Printf("Angular velocity: x=% .4f, y=% .4f, z=% .4f\n", sixaxis.angular_velocity.x, sixaxis.angular_velocity.y, sixaxis.angular_velocity.z);
 		Com_Printf("Angle:            x=% .4f, y=% .4f, z=% .4f\n", sixaxis.angle.x, sixaxis.angle.y, sixaxis.angle.z);
@@ -1344,7 +1735,7 @@ static void IN_ProcessGyro( int frameMsec )
 		yaw = yawAxis ? sixaxis.angular_velocity.z : sixaxis.angular_velocity.y;
 	}
 
-	if( clc.state == CA_DISCONNECTED || clc.state == CA_CINEMATIC || ( Key_GetCatcher( ) & KEYCATCH_UI ) ) {
+	if( inMenu ) {
 		pitch *= in_gyromouse_pitch_ui->value;
 		yaw *= in_gyromouse_yaw_ui->value;
 	} else {
@@ -1359,15 +1750,15 @@ static void IN_ProcessGyro( int frameMsec )
 	scale = (float)frameMsec * ( 60.0f / 1000.0f );
 
 	// carry the fractional part so slow, precise movements aren't truncated away
-	fx = yaw * scale + remX;
-	fy = pitch * scale + remY;
+	fx = yaw * scale + pl->gyroRemX;
+	fy = pitch * scale + pl->gyroRemY;
 	ix = (int)fx;
 	iy = (int)fy;
-	remX = fx - (float)ix;
-	remY = fy - (float)iy;
+	pl->gyroRemX = fx - (float)ix;
+	pl->gyroRemY = fy - (float)iy;
 
 	if( ix || iy )
-		Com_QueueEvent( in_eventTime, SE_MOUSE, ix, iy, 0, NULL );
+		IN_QueuePlayerEvent( player, SE_MOUSE, ix, iy );
 }
 
 
@@ -1380,9 +1771,9 @@ void IN_Frame( void )
 {
 	static int lastFrameTime = 0;
 	qboolean loading;
-	int now;
+	int now, player;
 
-	IN_GamepadMove( );
+	IN_PadFrame( );
 
 	// If not DISCONNECTED (main menu) or ACTIVE (in game), we're loading
 	loading = ( clc.state != CA_DISCONNECTED && clc.state != CA_ACTIVE );
@@ -1411,7 +1802,8 @@ void IN_Frame( void )
 	IN_ProcessEvents( );
 
 	now = Sys_Milliseconds( );
-	IN_ProcessGyro( lastFrameTime ? now - lastFrameTime : 16 );
+	for( player = 0; player < cl_numLocalClients && player < NX_MAX_PLAYERS; player++ )
+		IN_ProcessGyro( player, lastFrameTime ? now - lastFrameTime : 16 );
 	lastFrameTime = now;
 
 	// Set event time for next frame to earliest possible time an event could happen
@@ -1469,6 +1861,8 @@ void IN_Init( void *windowData )
 	in_joystickThreshold = Cvar_Get( "joy_threshold", "0.15", CVAR_ARCHIVE );
 	in_joystickUseAnalog = Cvar_Get( "in_joystickUseAnalog", "1", CVAR_ARCHIVE );
 	in_joyconStickRotate = Cvar_Get( "in_joyconStickRotate", "1", CVAR_ARCHIVE );
+	in_gyroSingleJoyCon = Cvar_Get( "in_gyroSingleJoyCon", "1", CVAR_ARCHIVE );
+	in_padJoin = Cvar_Get( "in_padJoin", "1", CVAR_ARCHIVE );
 
 	mouseAvailable = ( in_mouse->value != 0 );
 	IN_DeactivateMouse( Cvar_VariableIntegerValue( "r_fullscreen" ) != 0 );

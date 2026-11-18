@@ -143,7 +143,11 @@ typedef struct {
 	entityState_t	parseEntities[MAX_PARSE_ENTITIES];
 } clientActive_t;
 
-extern	clientActive_t		cl;
+// Split-screen: each local client has its own clientActive_t and
+// clientConnection_t. "cl" and "clc" always refer to the current one, which
+// is selected with CL_SetLocalClient().
+extern	clientActive_t		*cl_current;
+#define	cl	( *cl_current )
 
 /*
 =============================================================================
@@ -270,7 +274,27 @@ typedef struct {
 	netchan_t	netchan;
 } clientConnection_t;
 
-extern	clientConnection_t clc;
+extern	clientConnection_t	*clc_current;
+#define	clc	( *clc_current )
+
+extern	int		cl_localClient;		// local client currently selected (0 = primary)
+extern	int		cl_numLocalClients;	// local clients in this session (1 = no split-screen)
+
+void		CL_SetLocalClient( int clientNum );
+qboolean	CL_LocalClientRuns( int clientNum );
+void		CL_GetViewport( int clientNum, int *x, int *y, int *w, int *h );
+connstate_t	CL_LocalClientState( int clientNum );
+void		CL_DisconnectLocalClient( int clientNum );
+void		CL_UserinfoString( char *info, int size );
+int			CL_EventPlayer( void );
+void		CL_ShutdownCGames( void );
+void		CL_ClearLocalClientInput( int clientNum );
+const char	*CL_LocalClientMessage( int clientNum );
+void		CL_AddPlayerCommandText( int player, const char *text );
+extern	qboolean	cl_dropLocalClient[MAX_LOCAL_CLIENTS];
+extern	qboolean	cl_worldMapLoaded;
+extern	cvar_t		*cl_splitscreen;
+extern	cvar_t		*cl_splitscreenVertical;
 
 /*
 ==================================================================
@@ -360,7 +384,8 @@ extern	qboolean	cl_oldGameSet;
 
 //=============================================================================
 
-extern	vm_t			*cgvm;	// interface to cgame dll or vm
+extern	vm_t			*cl_cgvms[MAX_LOCAL_CLIENTS];
+#define	cgvm	( cl_cgvms[cl_localClient] )	// interface to cgame dll or vm, one per local client
 extern	vm_t			*uivm;	// interface to ui dll or vm
 extern	refexport_t		re;		// interface to refresh .dll
 

@@ -45,6 +45,12 @@ void CL_Frame ( int msec ) {
 void CL_PacketEvent( netadr_t from, msg_t *msg ) {
 }
 
+void CL_PumpLoopback( msg_t *buf ) {
+}
+
+void CL_SetEventPlayer( int player ) {
+}
+
 void CL_CharEvent( int key ) {
 }
 

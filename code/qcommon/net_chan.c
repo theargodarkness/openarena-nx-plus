@@ -120,7 +120,7 @@ void Netchan_TransmitNextFragment( netchan_t *chan ) {
 
 	// send the qport if we are a client
 	if ( chan->sock == NS_CLIENT ) {
-		MSG_WriteShort( &send, qport->integer );
+		MSG_WriteShort( &send, chan->qport );
 	}
 
 #ifdef LEGACY_PROTOCOL
@@ -202,7 +202,7 @@ void Netchan_Transmit( netchan_t *chan, int length, const byte *data ) {
 
 	// send the qport if we are a client
 	if(chan->sock == NS_CLIENT)
-		MSG_WriteShort(&send, qport->integer);
+		MSG_WriteShort(&send, chan->qport);
 
 #ifdef LEGACY_PROTOCOL
 	if(!chan->compat)
@@ -421,11 +421,12 @@ LOOPBACK BUFFERS FOR LOCAL PLAYER
 
 // there needs to be enough loopback messages to hold a complete
 // gamestate of maximum size
-#define	MAX_LOOPBACK	16
+#define	MAX_LOOPBACK	64
 
 typedef struct {
 	byte	data[MAX_PACKETLEN];
 	int		datalen;
+	int		client;		// local client that sent it (server inbox only)
 } loopmsg_t;
 
 typedef struct {
@@ -433,7 +434,37 @@ typedef struct {
 	int			get, send;
 } loopback_t;
 
-loopback_t	loopbacks[2];
+// Split-screen: every local client has its own inbox, and the server has one
+// that remembers which client each message came from. A loopback address
+// carries the local client number in its port field.
+#define LOOP_SERVER		0
+#define LOOP_CLIENT(n)	( 1 + (n) )
+
+loopback_t	loopbacks[1 + MAX_LOCAL_CLIENTS];
+static int	net_loopClient = 0;
+
+/*
+=============
+NET_SetLoopClient
+
+Selects which local client NS_CLIENT loopback reads belong to
+=============
+*/
+void NET_SetLoopClient( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_LOCAL_CLIENTS ) {
+		clientNum = 0;
+	}
+	net_loopClient = clientNum;
+}
+
+static int NET_LoopClientFromAdr( netadr_t adr ) {
+	int n = adr.port;
+
+	if ( n < 0 || n >= MAX_LOCAL_CLIENTS ) {
+		n = 0;
+	}
+	return n;
+}
 
 
 qboolean	NET_GetLoopPacket (netsrc_t sock, netadr_t *net_from, msg_t *net_message)
@@ -441,7 +472,11 @@ qboolean	NET_GetLoopPacket (netsrc_t sock, netadr_t *net_from, msg_t *net_messag
 	int		i;
 	loopback_t	*loop;
 
-	loop = &loopbacks[sock];
+	if ( sock == NS_SERVER ) {
+		loop = &loopbacks[LOOP_SERVER];
+	} else {
+		loop = &loopbacks[LOOP_CLIENT( net_loopClient )];
+	}
 
 	if (loop->send - loop->get > MAX_LOOPBACK)
 		loop->get = loop->send - MAX_LOOPBACK;
@@ -456,6 +491,7 @@ qboolean	NET_GetLoopPacket (netsrc_t sock, netadr_t *net_from, msg_t *net_messag
 	net_message->cursize = loop->msgs[i].datalen;
 	Com_Memset (net_from, 0, sizeof(*net_from));
 	net_from->type = NA_LOOPBACK;
+	net_from->port = ( sock == NS_SERVER ) ? loop->msgs[i].client : net_loopClient;
 	return qtrue;
 
 }
@@ -466,13 +502,20 @@ void NET_SendLoopPacket (netsrc_t sock, int length, const void *data, netadr_t t
 	int		i;
 	loopback_t	*loop;
 
-	loop = &loopbacks[sock^1];
+	// the port of a loopback address is the local client number, whichever
+	// direction the packet travels
+	if ( sock == NS_SERVER ) {
+		loop = &loopbacks[LOOP_CLIENT( NET_LoopClientFromAdr( to ) )];
+	} else {
+		loop = &loopbacks[LOOP_SERVER];
+	}
 
 	i = loop->send & (MAX_LOOPBACK-1);
 	loop->send++;
 
 	Com_Memcpy (loop->msgs[i].data, data, length);
 	loop->msgs[i].datalen = length;
+	loop->msgs[i].client = NET_LoopClientFromAdr( to );
 }
 
 //=============================================================================

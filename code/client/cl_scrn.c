@@ -472,6 +472,53 @@ SCR_DrawScreenField
 This will be called twice if rendering in stereo mode
 ==================
 */
+/*
+==================
+SCR_DrawLocalClients
+
+Draws the game for every split-screen player, each into its own part of
+the screen. Parts nobody is playing in yet are blanked.
+==================
+*/
+static void SCR_DrawLocalClients( stereoFrame_t stereoFrame ) {
+	int i, views;
+
+	if ( cl_numLocalClients < 2 ) {
+		CL_CGameRendering( stereoFrame );
+		return;
+	}
+
+	// three players leave a quarter of the screen empty
+	views = ( cl_numLocalClients == 3 ) ? 4 : cl_numLocalClients;
+
+	for ( i = 0; i < views; i++ ) {
+		int x, y, w, h;
+
+		CL_GetViewport( i, &x, &y, &w, &h );
+
+		if ( i < cl_numLocalClients && CL_LocalClientState( i ) == CA_ACTIVE && cl_cgvms[i] ) {
+			CL_SetLocalClient( i );
+			CL_CGameRendering( stereoFrame );
+			CL_SetLocalClient( 0 );
+			continue;
+		}
+
+		re.SetColor( g_color_table[0] );
+		re.DrawStretchPic( x, y, w, h, 0, 0, 0, 0, cls.whiteShader );
+		re.SetColor( NULL );
+
+		if ( i < cl_numLocalClients ) {
+			const char *msg = CL_LocalClientMessage( i );
+			const char *text = msg[0] ? va( "Player %d: %s", i + 1, msg ) : va( "Player %d joining...", i + 1 );
+			int cx = ( x + w / 2 ) * SCREEN_WIDTH / cls.glconfig.vidWidth;
+			int cy = ( y + h / 2 ) * SCREEN_HEIGHT / cls.glconfig.vidHeight;
+
+			SCR_DrawStringExt( cx - (int)strlen( text ) * SMALLCHAR_WIDTH / 2, cy - SMALLCHAR_HEIGHT / 2,
+				SMALLCHAR_WIDTH, text, g_color_table[7], qtrue, qfalse );
+		}
+	}
+}
+
 void SCR_DrawScreenField( stereoFrame_t stereoFrame ) {
 	qboolean uiFullscreen;
 
@@ -525,7 +572,7 @@ void SCR_DrawScreenField( stereoFrame_t stereoFrame ) {
 			break;
 		case CA_ACTIVE:
 			// always supply STEREO_CENTER as vieworg offset is now done by the engine.
-			CL_CGameRendering(stereoFrame);
+			SCR_DrawLocalClients(stereoFrame);
 			SCR_DrawDemoRecording();
 #ifdef USE_VOIP
 			SCR_DrawVoipMeter();

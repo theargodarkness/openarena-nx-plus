@@ -2193,6 +2193,7 @@ int Com_EventLoop( void ) {
 	netadr_t	evFrom;
 	byte		bufData[MAX_MSGLEN];
 	msg_t		buf;
+	int			eventPlayer = 0;
 
 	MSG_Init( &buf, bufData, sizeof( bufData ) );
 
@@ -2202,9 +2203,7 @@ int Com_EventLoop( void ) {
 		// if no more events are available
 		if ( ev.evType == SE_NONE ) {
 			// manually send packet events for the loopback channel
-			while ( NET_GetLoopPacket( NS_CLIENT, &evFrom, &buf ) ) {
-				CL_PacketEvent( evFrom, &buf );
-			}
+			CL_PumpLoopback( &buf );
 
 			while ( NET_GetLoopPacket( NS_SERVER, &evFrom, &buf ) ) {
 				// if the server just shut down, flush the events
@@ -2219,17 +2218,27 @@ int Com_EventLoop( void ) {
 
 		switch(ev.evType)
 		{
+			case SE_PLAYER:
+				// tags the next input event with a split-screen player
+				eventPlayer = ev.evValue;
+				continue;
 			case SE_KEY:
+				CL_SetEventPlayer( eventPlayer );
 				CL_KeyEvent( ev.evValue, ev.evValue2, ev.evTime );
+				CL_SetEventPlayer( 0 );
 			break;
 			case SE_CHAR:
 				CL_CharEvent( ev.evValue );
 			break;
 			case SE_MOUSE:
+				CL_SetEventPlayer( eventPlayer );
 				CL_MouseEvent( ev.evValue, ev.evValue2, ev.evTime );
+				CL_SetEventPlayer( 0 );
 			break;
 			case SE_JOYSTICK_AXIS:
+				CL_SetEventPlayer( eventPlayer );
 				CL_JoystickEvent( ev.evValue, ev.evValue2, ev.evTime );
+				CL_SetEventPlayer( 0 );
 			break;
 			case SE_CONSOLE:
 				Cbuf_AddText( (char *)ev.evPtr );
@@ -2239,6 +2248,8 @@ int Com_EventLoop( void ) {
 				Com_Error( ERR_FATAL, "Com_EventLoop: bad event type %i", ev.evType );
 			break;
 		}
+
+		eventPlayer = 0;
 
 		// free any block data
 		if ( ev.evPtr ) {
