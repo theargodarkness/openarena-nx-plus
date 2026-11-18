@@ -13,7 +13,8 @@ jobs:
 
     - name: Install dependencies & git
       run: |
-        dkp-pacman -Syu --noconfirm --needed switch-sdl2 switch-openal-soft switch-mesa switch-libdrm_nouveau switch-glad switch-libvorbis switch-libogg switch-libmad switch-libjpeg-turbo switch-curl switch-mbedtls switch-zlib git
+        dkp-pacman -Syu --noconfirm --needed switch-sdl2 switch-openal-soft switch-mesa switch-libdrm_nouveau switch-glad switch-libvorbis switch-libogg switch-libmad switch-libjpeg-turbo switch-curl switch-mbedtls switch-zlib
+        command -v git >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends git ca-certificates)
 
     - name: Install Ounce SDK
       run: |
