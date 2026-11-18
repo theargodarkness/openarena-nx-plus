@@ -704,6 +704,26 @@ Cmd_RemoveCommandSafe
 Only remove commands with no associated function
 ============
 */
+/*
+============
+Cmd_HasFunction
+
+True for commands the engine handles itself, as opposed to names the game
+code registered only so that they tab-complete
+============
+*/
+qboolean Cmd_HasFunction( const char *cmd_name )
+{
+	cmd_function_t *cmd;
+
+	for ( cmd = cmd_functions; cmd; cmd = cmd->next ) {
+		if ( !Q_stricmp( cmd_name, cmd->name ) ) {
+			return cmd->function != NULL;
+		}
+	}
+	return qfalse;
+}
+
 void Cmd_RemoveCommandSafe( const char *cmd_name )
 {
 	cmd_function_t *cmd = Cmd_FindCommand( cmd_name );

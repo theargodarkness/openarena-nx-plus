@@ -452,6 +452,7 @@ typedef void (*completionFunc_t)( char *args, int argNum );
 
 // don't allow VMs to remove system commands
 void	Cmd_RemoveCommandSafe( const char *cmd_name );
+qboolean	Cmd_HasFunction( const char *cmd_name );
 
 void	Cmd_CommandCompletion( void(*callback)(const char *s) );
 // callback with each valid string

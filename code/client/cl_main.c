@@ -1307,6 +1307,18 @@ qboolean CL_LocalClientRuns( int clientNum ) {
 
 /*
 =====================
+CL_SplitScreenActive
+
+The screen is only divided while the primary is in the game. Its loading
+and connection screens use all of it.
+=====================
+*/
+qboolean CL_SplitScreenActive( void ) {
+	return cl_numLocalClients > 1 && cl_connections[0].state == CA_ACTIVE;
+}
+
+/*
+=====================
 CL_GetViewport
 
 Screen rectangle of a local client, in pixels with y going down.
@@ -1619,9 +1631,10 @@ binds from a player's controller arrive this way.
 =====================
 */
 static void CL_LocalPlayer_f( void ) {
-	char	cmd[MAX_STRING_CHARS];
-	int		num;
-	int		prev = cl_localClient;
+	char		cmd[MAX_STRING_CHARS];
+	const char	*name;
+	int			num;
+	int			prev = cl_localClient;
 
 	if ( Cmd_Argc() < 3 ) {
 		Com_Printf( "usage: lp <player 0-%d> <command>\n", MAX_LOCAL_CLIENTS - 1 );
@@ -1634,6 +1647,16 @@ static void CL_LocalPlayer_f( void ) {
 	}
 
 	Q_strncpyz( cmd, Cmd_ArgsFrom( 2 ), sizeof( cmd ) );
+
+	// Buttons (+attack), commands of the game code (weapnext) and commands
+	// passed on to the server (team, vote) belong to the player. Anything
+	// else the engine handles itself - togglemenu, vid_restart, map - is
+	// global and runs as the primary, whoever pressed the button.
+	name = Cmd_Argv( 2 );
+	if ( name[0] != '+' && name[0] != '-' && Cmd_HasFunction( name )
+		&& Q_stricmp( name, "cmd" ) && Q_stricmp( name, "centerview" ) ) {
+		num = 0;
+	}
 
 	CL_SetLocalClient( num );
 	Cmd_ExecuteString( cmd );
@@ -1902,6 +1925,9 @@ void CL_Disconnect( qboolean showMainMenu ) {
 		}
 	}
 	CL_SetLocalClient( 0 );
+
+	// split-screen is decided again when the next local game starts
+	cl_numLocalClients = 1;
 
 	// shutting down the client so enter full screen ui mode
 	Cvar_Set("r_uiFullScreen", "1");
