@@ -1,5 +1,8 @@
 #---------------------------------------------------------------------------------
 .SUFFIXES:
+
+# the makefile being run, so the build directory re-enters the right one
+THIS_MAKEFILE := $(abspath $(firstword $(MAKEFILE_LIST)))
 #---------------------------------------------------------------------------------
 
 ifeq ($(strip $(DEVKITPRO)),)
@@ -406,7 +409,7 @@ all: $(BUILD)
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
-	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile.nx
+	@$(MAKE) --no-print-directory -C $(BUILD) -f $(THIS_MAKEFILE)
 
 #---------------------------------------------------------------------------------
 clean:
