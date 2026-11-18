@@ -283,6 +283,7 @@ extern	int		cl_numLocalClients;	// local clients in this session (1 = no split-s
 void		CL_SetLocalClient( int clientNum );
 qboolean	CL_LocalClientRuns( int clientNum );
 void		CL_GetViewport( int clientNum, int *x, int *y, int *w, int *h );
+qboolean	CL_SplitScreenActive( void );
 connstate_t	CL_LocalClientState( int clientNum );
 void		CL_DisconnectLocalClient( int clientNum );
 void		CL_UserinfoString( char *info, int size );

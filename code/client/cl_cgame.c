@@ -427,7 +427,7 @@ static void CL_LoadWorldMap( const char *name ) {
 
 static void CL_DrawStretchPic( float x, float y, float w, float h,
 		float s1, float t1, float s2, float t2, qhandle_t hShader ) {
-	if ( cl_numLocalClients > 1 ) {
+	if ( CL_SplitScreenActive() ) {
 		int		vx, vy, vw, vh;
 		float	sx, sy;
 
@@ -449,7 +449,7 @@ static void CL_RenderScene( const refdef_t *fd ) {
 	int			vx, vy, vw, vh;
 	float		sx, sy;
 
-	if ( cl_numLocalClients < 2 ) {
+	if ( !CL_SplitScreenActive() ) {
 		re.RenderScene( fd );
 		return;
 	}
