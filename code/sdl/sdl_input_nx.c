@@ -1889,7 +1889,7 @@ void IN_Init( void *windowData )
 	in_joyconStickRotate = Cvar_Get( "in_joyconStickRotate", "1", CVAR_ARCHIVE );
 	in_gyroSingleJoyCon = Cvar_Get( "in_gyroSingleJoyCon", "1", CVAR_ARCHIVE );
 	in_padJoin = Cvar_Get( "in_padJoin", "1", CVAR_ARCHIVE );
-	in_padDebug = Cvar_Get( "in_padDebug", "0", CVAR_TEMP );
+	in_padDebug = Cvar_Get( "in_padDebug", "1", CVAR_TEMP );	// test build: on by default
 
 	mouseAvailable = ( in_mouse->value != 0 );
 	IN_DeactivateMouse( Cvar_VariableIntegerValue( "r_fullscreen" ) != 0 );
