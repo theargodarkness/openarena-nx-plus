@@ -13,14 +13,16 @@ jobs:
 
     - name: Install dependencies & git
       run: |
-        dkp-pacman -Syu --noconfirm --needed switch-sdl2 switch-openal-soft switch-mesa switch-libdrm_nouveau switch-glad switch-libvorbis switch-libogg switch-libmad switch-libjpeg-turbo switch-curl switch-mbedtls switch-zlib
+        # The devkitPro image already ships these. Only talk to devkitPro's
+        # package server (which often refuses CI runners) if one is missing.
+        missing=""
+        for pkg in switch-sdl2 switch-openal-soft switch-mesa switch-libdrm_nouveau switch-glad switch-libvorbis switch-libogg switch-libmad switch-libjpeg-turbo switch-curl switch-mbedtls switch-zlib; do
+          dkp-pacman -Q "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+        done
+        if [ -n "$missing" ]; then
+          dkp-pacman -Sy --noconfirm --needed $missing
+        fi
         command -v git >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends git ca-certificates)
-
-    - name: Install Ounce SDK
-      run: |
-        git clone https://github.com/ouncebrew/ounce-devkit.git /tmp/ounce-devkit
-        cd /tmp/ounce-devkit
-        sh install.sh
 
     - name: Get short SHA
       id: slug
@@ -30,15 +32,23 @@ jobs:
     - name: Build OpenArenaNX (Switch 1)
       run: make -f Makefile.nx -j$(nproc)
 
-    - name: Build OpenArenaNX (Switch 2)
-      run: make -f Makefile.nx2 -j$(nproc)
-
     - name: Push Switch 1 NRO artifact
       uses: actions/upload-artifact@v4
       with:
         name: openarenanx-switch1_${{ steps.slug.outputs.sha8 }}
         path: OpenArenaNX.nro
         if-no-files-found: error
+
+    # The Switch 2 build comes second so that a problem with its SDK never
+    # costs the Switch 1 NRO above.
+    - name: Install Ounce SDK
+      run: |
+        git clone https://github.com/ouncebrew/ounce-devkit.git /tmp/ounce-devkit
+        cd /tmp/ounce-devkit
+        sh install.sh
+
+    - name: Build OpenArenaNX (Switch 2)
+      run: make -f Makefile.nx2 -j$(nproc)
 
     - name: Push Switch 2 NRO artifact
       uses: actions/upload-artifact@v4
