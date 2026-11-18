@@ -37,9 +37,6 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 static cvar_t *in_keyboardDebug     = NULL;
 static char keyboardShiftMap[K_LAST_KEY];
 
-static SDL_GameController *gamepad = NULL;
-static SDL_Joystick *stick = NULL;
-
 static qboolean mouseAvailable = qfalse;
 static qboolean mouseActive = qfalse;
 
@@ -53,13 +50,12 @@ static cvar_t *in_gyromouse_pitch_ui = NULL; // Negative values invert (in-menu)
 static cvar_t *in_gyromouse_yaw_ui   = NULL; // Negative values invert (in-menu)
 static cvar_t *in_gyromouse_yaw_axis     = NULL; // 0 = .y is yaw, 1 = .z is yaw
 static cvar_t *in_gyromouse_debug    = NULL;
-static HidSixAxisSensorHandle sixaxis_handles[4];
-static PadState pad;
+static cvar_t *in_gyromouse_yaw_auto = NULL; // 1 = pick the yaw axis from how the pad is held
 static s32 prev_touchcount=0;
 
 static cvar_t *in_joystick          = NULL;
 static cvar_t *in_joystickThreshold = NULL;
-static cvar_t *in_joystickNo        = NULL;
+static cvar_t *in_joyconStickRotate = NULL; // rotate the stick of a sideways single Joy-Con
 static cvar_t *in_joystickUseAnalog = NULL;
 
 static int vidRestartTime = 0;
@@ -422,39 +418,6 @@ static void IN_DeactivateMouse( qboolean isFullscreen )
 	}
 }
 
-// We translate axes movement into keypresses
-static int joy_keys[16] = {
-	K_LEFTARROW, K_RIGHTARROW,
-	K_UPARROW, K_DOWNARROW,
-	K_JOY17, K_JOY18,
-	K_JOY19, K_JOY20,
-	K_JOY21, K_JOY22,
-	K_JOY23, K_JOY24,
-	K_JOY25, K_JOY26,
-	K_JOY27, K_JOY28
-};
-
-// translate hat events into keypresses
-// the 4 highest buttons are used for the first hat ...
-static int hat_keys[16] = {
-	K_JOY29, K_JOY30,
-	K_JOY31, K_JOY32,
-	K_JOY25, K_JOY26,
-	K_JOY27, K_JOY28,
-	K_JOY21, K_JOY22,
-	K_JOY23, K_JOY24,
-	K_JOY17, K_JOY18,
-	K_JOY19, K_JOY20
-};
-
-struct
-{
-	qboolean buttons[SDL_CONTROLLER_BUTTON_MAX + 1]; // +1 because old max was 16, current SDL_CONTROLLER_BUTTON_MAX is 15
-	unsigned int oldaxes;
-	int oldaaxes[MAX_JOYSTICK_AXIS];
-	unsigned int oldhats;
-} stick_state;
-
 /*
 ==============
 IN_InitKeyMaps
@@ -493,126 +456,360 @@ static void IN_InitKeys( void )
 }
 
 /*
-===============
-IN_InitJoystick
-===============
+===========================================================================
+Native (libnx) controller backend
+
+Controllers are read straight from HID instead of through SDL's joystick
+layer. switch-sdl2 only ever exposed player 1 to us, left the last button
+state latched when a pad dropped off, and popped the system controller
+applet by itself whenever a pad changed type. Reading npads directly lets
+us release everything cleanly on disconnect, accept whichever controller
+the player actually picked up, and (later) give every local player a pad.
+===========================================================================
 */
-static void IN_InitJoystick( void )
+
+#define NX_MAX_PLAYERS   4
+#define NX_NUM_SLOTS     ( NX_MAX_PLAYERS + 1 )	// No1..No4 + handheld
+#define NX_SLOT_HANDHELD NX_MAX_PLAYERS
+#define NX_NUM_BUTTONS   15						// SDL_CONTROLLER_BUTTON_A..DPAD_RIGHT
+#define NX_NUM_AXES      6						// SDL_CONTROLLER_AXIS_LEFTX..TRIGGERRIGHT
+
+typedef struct
 {
-	int i = 0;
-	int total = 0;
-	char buf[16384] = "";
+	HidNpadIdType id;
+	PadState pad;
+	u32 style;								// active HidNpadStyleTag, 0 = not connected
+	HidSixAxisSensorHandle sixaxis[2];
+	int numSixaxis;
+} nxPad_t;
 
-	if (gamepad)
-		SDL_GameControllerClose(gamepad);
+static nxPad_t nx_pads[NX_NUM_SLOTS];
+static qboolean nx_padsInitialized = qfalse;
+static int nx_activeSlot = -1;				// pad that last produced input; its gyro is the one we use
 
-	if (stick != NULL)
-		SDL_JoystickClose(stick);
+struct
+{
+	qboolean buttons[NX_NUM_BUTTONS];
+	int oldaaxes[MAX_JOYSTICK_AXIS];
+} stick_state;
 
-	stick = NULL;
-	gamepad = NULL;
-	memset(&stick_state, '\0', sizeof (stick_state));
+// Indexed by SDL_CONTROLLER_BUTTON_*, which is what K_PAD0_A + i and the
+// existing binds expect. This reproduces the switch-sdl2 layout the port has
+// always used: the "A" slot is the bottom face button (physical B), and so on.
+static const u64 nx_buttonsFull[NX_NUM_BUTTONS] = {
+	HidNpadButton_B, HidNpadButton_A, HidNpadButton_Y, HidNpadButton_X,
+	HidNpadButton_Minus, 0, HidNpadButton_Plus,
+	HidNpadButton_StickL, HidNpadButton_StickR,
+	HidNpadButton_L, HidNpadButton_R,
+	HidNpadButton_Up, HidNpadButton_Down, HidNpadButton_Left, HidNpadButton_Right
+};
 
-	// SDL 2.0.4 requires SDL_INIT_JOYSTICK to be initialized separately from
-	// SDL_INIT_GAMECONTROLLER for SDL_JoystickOpen() to work correctly,
-	// despite https://wiki.libsdl.org/SDL_Init (retrieved 2016-08-16)
-	// indicating SDL_INIT_JOYSTICK should be initialized automatically.
-	if (!SDL_WasInit(SDL_INIT_JOYSTICK))
+// Single Joy-Con held sideways: face buttons keep their positions (bottom
+// button is still the "A" slot), stick click is start, SL/SR are the triggers.
+static const u64 nx_buttonsJoyLeft[NX_NUM_BUTTONS] = {
+	HidNpadButton_Left, HidNpadButton_Down, HidNpadButton_Up, HidNpadButton_Right,
+	HidNpadButton_Minus, 0, HidNpadButton_StickL,
+	0, 0,
+	0, 0,
+	0, 0, 0, 0
+};
+
+static const u64 nx_buttonsJoyRight[NX_NUM_BUTTONS] = {
+	HidNpadButton_A, HidNpadButton_X, HidNpadButton_B, HidNpadButton_Y,
+	HidNpadButton_Plus, 0, HidNpadButton_StickR,
+	0, 0,
+	0, 0,
+	0, 0, 0, 0
+};
+
+static const char *IN_NXStyleName( u32 style )
+{
+	switch( style )
 	{
-		Com_DPrintf("Calling SDL_Init(SDL_INIT_JOYSTICK)...\n");
-		if (SDL_Init(SDL_INIT_JOYSTICK) != 0)
-		{
-			Com_DPrintf("SDL_Init(SDL_INIT_JOYSTICK) failed: %s\n", SDL_GetError());
-			return;
-		}
-		Com_DPrintf("SDL_Init(SDL_INIT_JOYSTICK) passed.\n");
+		case HidNpadStyleTag_NpadHandheld: return "handheld";
+		case HidNpadStyleTag_NpadFullKey:  return "Pro Controller";
+		case HidNpadStyleTag_NpadJoyDual:  return "Joy-Con pair";
+		case HidNpadStyleTag_NpadJoyLeft:  return "single Joy-Con (L)";
+		case HidNpadStyleTag_NpadJoyRight: return "single Joy-Con (R)";
+		default:                           return "unknown";
 	}
+}
 
-	if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
-	{
-		Com_DPrintf("Calling SDL_Init(SDL_INIT_GAMECONTROLLER)...\n");
-		if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0)
-		{
-			Com_DPrintf("SDL_Init(SDL_INIT_GAMECONTROLLER) failed: %s\n", SDL_GetError());
-			return;
-		}
-		Com_DPrintf("SDL_Init(SDL_INIT_GAMECONTROLLER) passed.\n");
-	}
+static u32 IN_NXPrimaryStyle( u32 styleSet )
+{
+	if( styleSet & HidNpadStyleTag_NpadHandheld ) return HidNpadStyleTag_NpadHandheld;
+	if( styleSet & HidNpadStyleTag_NpadFullKey )  return HidNpadStyleTag_NpadFullKey;
+	if( styleSet & HidNpadStyleTag_NpadJoyDual )  return HidNpadStyleTag_NpadJoyDual;
+	if( styleSet & HidNpadStyleTag_NpadJoyLeft )  return HidNpadStyleTag_NpadJoyLeft;
+	if( styleSet & HidNpadStyleTag_NpadJoyRight ) return HidNpadStyleTag_NpadJoyRight;
+	return 0;
+}
 
-	total = SDL_NumJoysticks();
-	Com_DPrintf("%d possible joysticks\n", total);
+static void IN_NXStopSixAxis( nxPad_t *p )
+{
+	int i;
 
-	// Print list and build cvar to allow ui to select joystick.
-	for (i = 0; i < total; i++)
-	{
-		Q_strcat(buf, sizeof(buf), SDL_JoystickNameForIndex(i));
-		Q_strcat(buf, sizeof(buf), "\n");
-	}
-
-	Cvar_Get( "in_availableJoysticks", buf, CVAR_ROM );
-
-	if( !in_joystick->integer ) {
-		Com_DPrintf( "Joystick is not active.\n" );
-		SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
-		return;
-	}
-
-	in_joystickNo = Cvar_Get( "in_joystickNo", "0", CVAR_ARCHIVE );
-	if( in_joystickNo->integer < 0 || in_joystickNo->integer >= total )
-		Cvar_Set( "in_joystickNo", "0" );
-
-	in_joystickUseAnalog = Cvar_Get( "in_joystickUseAnalog", "1", CVAR_ARCHIVE );
-
-	stick = SDL_JoystickOpen( in_joystickNo->integer );
-
-	if (stick == NULL) {
-		Com_DPrintf( "No joystick opened: %s\n", SDL_GetError() );
-		return;
-	}
-
-	if (SDL_IsGameController(in_joystickNo->integer))
-		gamepad = SDL_GameControllerOpen(in_joystickNo->integer);
-
-	Com_DPrintf( "Joystick %d opened\n", in_joystickNo->integer );
-	Com_DPrintf( "Name:       %s\n", SDL_JoystickNameForIndex(in_joystickNo->integer) );
-	Com_DPrintf( "Axes:       %d\n", SDL_JoystickNumAxes(stick) );
-	Com_DPrintf( "Hats:       %d\n", SDL_JoystickNumHats(stick) );
-	Com_DPrintf( "Buttons:    %d\n", SDL_JoystickNumButtons(stick) );
-	Com_DPrintf( "Balls:      %d\n", SDL_JoystickNumBalls(stick) );
-	Com_DPrintf( "Use Analog: %s\n", in_joystickUseAnalog->integer ? "Yes" : "No" );
-	Com_DPrintf( "Is gamepad: %s\n", gamepad ? "Yes" : "No" );
-
-	SDL_JoystickEventState(SDL_QUERY);
-	SDL_GameControllerEventState(SDL_QUERY);
+	for( i = 0; i < p->numSixaxis; i++ )
+		hidStopSixAxisSensor( p->sixaxis[i] );
+	p->numSixaxis = 0;
 }
 
 /*
 ===============
-IN_ShutdownJoystick
+IN_NXPadChanged
+
+A pad connected, disconnected or changed type (e.g. Joy-Cons slid off the
+console, or a pair split into singles). Motion sensor handles are tied to
+the id+style, so they have to be fetched again.
 ===============
 */
-static void IN_ShutdownJoystick( void )
+static void IN_NXPadChanged( nxPad_t *p, int slot, u32 style )
 {
-	if ( !SDL_WasInit( SDL_INIT_GAMECONTROLLER ) )
+	int i, count;
+
+	IN_NXStopSixAxis( p );
+
+	if( slot == NX_SLOT_HANDHELD )
+		Com_Printf( "Controller (handheld): %s\n", style ? "connected" : "disconnected" );
+	else if( style )
+		Com_Printf( "Controller %d: %s connected\n", slot + 1, IN_NXStyleName( style ) );
+	else
+		Com_Printf( "Controller %d: disconnected\n", slot + 1 );
+
+	p->style = style;
+	if( !style )
 		return;
 
-	if ( !SDL_WasInit( SDL_INIT_JOYSTICK ) )
+	count = ( style == HidNpadStyleTag_NpadJoyDual ) ? 2 : 1;
+	if( R_SUCCEEDED( hidGetSixAxisSensorHandles( p->sixaxis, count, p->id, (HidNpadStyleTag)style ) ) )
+	{
+		for( i = 0; i < count; i++ )
+			hidStartSixAxisSensor( p->sixaxis[i] );
+		p->numSixaxis = count;
+	}
+}
+
+static int IN_NXClampAxis( int v )
+{
+	if( v > 32767 ) return 32767;
+	if( v < -32767 ) return -32767;
+	return v;
+}
+
+/*
+===============
+IN_NXReadPad
+
+Translate one pad into the SDL-style button/axis layout the rest of the
+input code works with. Y axes are positive-down, like SDL.
+===============
+*/
+static void IN_NXReadPad( nxPad_t *p, qboolean *buttons, int *axes )
+{
+	const u64 *map = nx_buttonsFull;
+	u64 down = padGetButtons( &p->pad );
+	HidAnalogStickState l = padGetStickPos( &p->pad, 0 );
+	HidAnalogStickState r = padGetStickPos( &p->pad, 1 );
+	int i;
+
+	if( p->style == HidNpadStyleTag_NpadJoyLeft )
+	{
+		map = nx_buttonsJoyLeft;
+		if( in_joyconStickRotate->integer )
+		{
+			// stick "up" points to the player's left
+			HidAnalogStickState t = l;
+			l.x = -t.y;
+			l.y = t.x;
+		}
+		r.x = r.y = 0;
+		axes[SDL_CONTROLLER_AXIS_TRIGGERLEFT]  = ( down & HidNpadButton_LeftSL ) ? 32767 : 0;
+		axes[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] = ( down & HidNpadButton_LeftSR ) ? 32767 : 0;
+	}
+	else if( p->style == HidNpadStyleTag_NpadJoyRight )
+	{
+		map = nx_buttonsJoyRight;
+		// the only stick on a right Joy-Con is the right one; it drives movement
+		l = r;
+		if( in_joyconStickRotate->integer )
+		{
+			// stick "up" points to the player's right
+			HidAnalogStickState t = l;
+			l.x = t.y;
+			l.y = -t.x;
+		}
+		r.x = r.y = 0;
+		axes[SDL_CONTROLLER_AXIS_TRIGGERLEFT]  = ( down & HidNpadButton_RightSL ) ? 32767 : 0;
+		axes[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] = ( down & HidNpadButton_RightSR ) ? 32767 : 0;
+	}
+	else
+	{
+		axes[SDL_CONTROLLER_AXIS_TRIGGERLEFT]  = ( down & HidNpadButton_ZL ) ? 32767 : 0;
+		axes[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] = ( down & HidNpadButton_ZR ) ? 32767 : 0;
+	}
+
+	for( i = 0; i < NX_NUM_BUTTONS; i++ )
+		buttons[i] = ( map[i] && ( down & map[i] ) ) ? qtrue : qfalse;
+
+	axes[SDL_CONTROLLER_AXIS_LEFTX]  = IN_NXClampAxis( l.x );
+	axes[SDL_CONTROLLER_AXIS_LEFTY]  = IN_NXClampAxis( -l.y );
+	axes[SDL_CONTROLLER_AXIS_RIGHTX] = IN_NXClampAxis( r.x );
+	axes[SDL_CONTROLLER_AXIS_RIGHTY] = IN_NXClampAxis( -r.y );
+}
+
+/*
+===============
+IN_NXPollPads
+
+Read every pad and merge them into one logical controller, so it doesn't
+matter which player slot Horizon put the controller in. With nothing
+connected (or in_joystick 0) everything reads as released, which makes the
+caller send key-ups instead of leaving buttons latched.
+===============
+*/
+static void IN_NXPollPads( qboolean *buttons, int *axes )
+{
+	int slot, i;
+
+	memset( buttons, 0, sizeof( qboolean ) * NX_NUM_BUTTONS );
+	memset( axes, 0, sizeof( int ) * NX_NUM_AXES );
+
+	if( !nx_padsInitialized )
 		return;
 
-	if (gamepad)
+	for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
 	{
-		SDL_GameControllerClose(gamepad);
-		gamepad = NULL;
+		nxPad_t *p = &nx_pads[slot];
+		qboolean padButtons[NX_NUM_BUTTONS];
+		int padAxes[NX_NUM_AXES];
+		qboolean active = qfalse;
+		u32 style;
+
+		padUpdate( &p->pad );
+		style = padIsConnected( &p->pad ) ? IN_NXPrimaryStyle( padGetStyleSet( &p->pad ) ) : 0;
+
+		if( style != p->style )
+			IN_NXPadChanged( p, slot, style );
+
+		if( !style || !in_joystick->integer )
+			continue;
+
+		IN_NXReadPad( p, padButtons, padAxes );
+
+		for( i = 0; i < NX_NUM_BUTTONS; i++ )
+		{
+			if( padButtons[i] )
+			{
+				buttons[i] = qtrue;
+				active = qtrue;
+			}
+		}
+
+		for( i = 0; i < NX_NUM_AXES; i++ )
+		{
+			if( abs( padAxes[i] ) > abs( axes[i] ) )
+				axes[i] = padAxes[i];
+			if( abs( padAxes[i] ) > 16384 )
+				active = qtrue;
+		}
+
+		if( active )
+			nx_activeSlot = slot;
 	}
 
-	if (stick)
+	// gyro follows the pad in use; fall back to any connected pad
+	if( nx_activeSlot < 0 || !nx_pads[nx_activeSlot].style )
 	{
-		SDL_JoystickClose(stick);
-		stick = NULL;
+		nx_activeSlot = -1;
+		for( slot = NX_NUM_SLOTS - 1; slot >= 0; slot-- )
+		{
+			if( nx_pads[slot].style )
+				nx_activeSlot = slot;
+		}
 	}
+}
 
-	SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
-	SDL_QuitSubSystem(SDL_INIT_JOYSTICK);
+/*
+===============
+IN_InitPads
+===============
+*/
+static void IN_InitPads( void )
+{
+	int i;
+
+	// Up to four wireless controllers plus the attached Joy-Cons. Horizontal
+	// hold is what makes a lone Joy-Con usable sideways.
+	padConfigureInput( NX_MAX_PLAYERS, HidNpadStyleSet_NpadStandard );
+	hidSetNpadJoyHoldType( HidNpadJoyHoldType_Horizontal );
+
+	if( nx_padsInitialized )
+		return;
+
+	memset( nx_pads, 0, sizeof( nx_pads ) );
+	memset( &stick_state, 0, sizeof( stick_state ) );
+
+	for( i = 0; i < NX_MAX_PLAYERS; i++ )
+	{
+		nx_pads[i].id = (HidNpadIdType)( HidNpadIdType_No1 + i );
+		padInitialize( &nx_pads[i].pad, nx_pads[i].id );
+	}
+	nx_pads[NX_SLOT_HANDHELD].id = HidNpadIdType_Handheld;
+	padInitialize( &nx_pads[NX_SLOT_HANDHELD].pad, HidNpadIdType_Handheld );
+
+	nx_activeSlot = -1;
+	nx_padsInitialized = qtrue;
+}
+
+/*
+===============
+IN_ShutdownPads
+===============
+*/
+static void IN_ShutdownPads( void )
+{
+	int i;
+
+	if( !nx_padsInitialized )
+		return;
+
+	for( i = 0; i < NX_NUM_SLOTS; i++ )
+	{
+		IN_NXStopSixAxis( &nx_pads[i] );
+		nx_pads[i].style = 0;	// sensors get restarted if we come back up
+	}
+}
+
+/*
+===============
+IN_Controllers_f
+
+Opens the system "Controllers" screen: re-pair pads, change grip/order, or
+split a Joy-Con pair into two sideways controllers (press SL+SR on each).
+===============
+*/
+static void IN_Controllers_f( void )
+{
+	HidLaControllerSupportArg args;
+	HidLaControllerSupportResultInfo info;
+	int maxPlayers = NX_MAX_PLAYERS;
+	Result rc;
+
+	if( Cmd_Argc( ) > 1 )
+		maxPlayers = atoi( Cmd_Argv( 1 ) );
+	if( maxPlayers < 1 )
+		maxPlayers = 1;
+	if( maxPlayers > NX_MAX_PLAYERS )
+		maxPlayers = NX_MAX_PLAYERS;
+
+	hidLaCreateControllerSupportArg( &args );
+	args.hdr.player_count_max = maxPlayers;
+	if( maxPlayers == 1 )
+		args.hdr.enable_single_mode = 1;
+
+	rc = hidLaShowControllerSupportForSystem( &info, &args, false );
+	if( R_FAILED( rc ) )
+		Com_Printf( "Controller applet failed (0x%x). It is not available in applet (album) mode.\n", (unsigned int)rc );
 }
 
 
@@ -694,14 +891,16 @@ static void IN_GamepadMove( void )
 	int i;
 	int translatedAxes[MAX_JOYSTICK_AXIS];
 	qboolean translatedAxesSet[MAX_JOYSTICK_AXIS];
-	qboolean changed[SDL_CONTROLLER_BUTTON_MAX] = { qfalse };
+	qboolean changed[NX_NUM_BUTTONS] = { qfalse };
+	qboolean nxButtons[NX_NUM_BUTTONS];
+	int nxAxes[NX_NUM_AXES];
 
-	SDL_GameControllerUpdate();
+	IN_NXPollPads( nxButtons, nxAxes );
 
 	// check buttons
-	for (i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++)
+	for (i = 0; i < NX_NUM_BUTTONS; i++)
 	{
-		qboolean pressed = SDL_GameControllerGetButton(gamepad, SDL_CONTROLLER_BUTTON_A + i);
+		qboolean pressed = nxButtons[i];
 		if (pressed != stick_state.buttons[i])
 		{
 			Com_QueueEvent(in_eventTime, SE_KEY, K_PAD0_A + i, pressed, 0, NULL);
@@ -722,9 +921,9 @@ static void IN_GamepadMove( void )
 	}
 
 	// check axes
-	for (i = 0; i < SDL_CONTROLLER_AXIS_MAX; i++)
+	for (i = 0; i < NX_NUM_AXES; i++)
 	{
-		int axis = SDL_GameControllerGetAxis(gamepad, SDL_CONTROLLER_AXIS_LEFTX + i);
+		int axis = nxAxes[i];
 		int oldAxis = stick_state.oldaaxes[i];
 
 		// Smoothly ramp from dead zone to maximum value
@@ -737,8 +936,8 @@ static void IN_GamepadMove( void )
 
 		if (axis != oldAxis)
 		{
-			const int negMap[SDL_CONTROLLER_AXIS_MAX] = { K_PAD0_LEFTSTICK_LEFT,  K_PAD0_LEFTSTICK_UP,   K_PAD0_RIGHTSTICK_LEFT,  K_PAD0_RIGHTSTICK_UP, 0, 0 };
-			const int posMap[SDL_CONTROLLER_AXIS_MAX] = { K_PAD0_LEFTSTICK_RIGHT, K_PAD0_LEFTSTICK_DOWN, K_PAD0_RIGHTSTICK_RIGHT, K_PAD0_RIGHTSTICK_DOWN, K_PAD0_LEFTTRIGGER, K_PAD0_RIGHTTRIGGER };
+			const int negMap[NX_NUM_AXES] = { K_PAD0_LEFTSTICK_LEFT,  K_PAD0_LEFTSTICK_UP,   K_PAD0_RIGHTSTICK_LEFT,  K_PAD0_RIGHTSTICK_UP, 0, 0 };
+			const int posMap[NX_NUM_AXES] = { K_PAD0_LEFTSTICK_RIGHT, K_PAD0_LEFTSTICK_DOWN, K_PAD0_RIGHTSTICK_RIGHT, K_PAD0_RIGHTSTICK_DOWN, K_PAD0_LEFTTRIGGER, K_PAD0_RIGHTTRIGGER };
 
 			qboolean posAnalog = qfalse, negAnalog = qfalse;
 			int negKey = negMap[i];
@@ -883,216 +1082,6 @@ static void IN_GamepadMove( void )
 
 /*
 ===============
-IN_JoyMove
-===============
-*/
-static void IN_JoyMove( void )
-{
-	unsigned int axes = 0;
-	unsigned int hats = 0;
-	int total = 0;
-	int i = 0;
-
-	if (gamepad)
-	{
-		IN_GamepadMove();
-		return;
-	}
-
-	if (!stick)
-		return;
-
-	SDL_JoystickUpdate();
-
-	// update the ball state.
-	total = SDL_JoystickNumBalls(stick);
-	if (total > 0)
-	{
-		int balldx = 0;
-		int balldy = 0;
-		for (i = 0; i < total; i++)
-		{
-			int dx = 0;
-			int dy = 0;
-			SDL_JoystickGetBall(stick, i, &dx, &dy);
-			balldx += dx;
-			balldy += dy;
-		}
-		if (balldx || balldy)
-		{
-			// !!! FIXME: is this good for stick balls, or just mice?
-			// Scale like the mouse input...
-			if (abs(balldx) > 1)
-				balldx *= 2;
-			if (abs(balldy) > 1)
-				balldy *= 2;
-			Com_QueueEvent( in_eventTime, SE_MOUSE, balldx, balldy, 0, NULL );
-		}
-	}
-
-	// now query the stick buttons...
-	total = SDL_JoystickNumButtons(stick);
-	if (total > 0)
-	{
-		if (total > ARRAY_LEN(stick_state.buttons))
-			total = ARRAY_LEN(stick_state.buttons);
-		for (i = 0; i < total; i++)
-		{
-			qboolean pressed = (SDL_JoystickGetButton(stick, i) != 0);
-			if (pressed != stick_state.buttons[i])
-			{
-				Com_QueueEvent( in_eventTime, SE_KEY, K_JOY1 + i, pressed, 0, NULL );
-				stick_state.buttons[i] = pressed;
-			}
-		}
-	}
-
-	// look at the hats...
-	total = SDL_JoystickNumHats(stick);
-	if (total > 0)
-	{
-		if (total > 4) total = 4;
-		for (i = 0; i < total; i++)
-		{
-			((Uint8 *)&hats)[i] = SDL_JoystickGetHat(stick, i);
-		}
-	}
-
-	// update hat state
-	if (hats != stick_state.oldhats)
-	{
-		for( i = 0; i < 4; i++ ) {
-			if( ((Uint8 *)&hats)[i] != ((Uint8 *)&stick_state.oldhats)[i] ) {
-				// release event
-				switch( ((Uint8 *)&stick_state.oldhats)[i] ) {
-					case SDL_HAT_UP:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qfalse, 0, NULL );
-						break;
-					case SDL_HAT_RIGHT:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qfalse, 0, NULL );
-						break;
-					case SDL_HAT_DOWN:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qfalse, 0, NULL );
-						break;
-					case SDL_HAT_LEFT:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qfalse, 0, NULL );
-						break;
-					case SDL_HAT_RIGHTUP:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qfalse, 0, NULL );
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qfalse, 0, NULL );
-						break;
-					case SDL_HAT_RIGHTDOWN:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qfalse, 0, NULL );
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qfalse, 0, NULL );
-						break;
-					case SDL_HAT_LEFTUP:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qfalse, 0, NULL );
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qfalse, 0, NULL );
-						break;
-					case SDL_HAT_LEFTDOWN:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qfalse, 0, NULL );
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qfalse, 0, NULL );
-						break;
-					default:
-						break;
-				}
-				// press event
-				switch( ((Uint8 *)&hats)[i] ) {
-					case SDL_HAT_UP:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qtrue, 0, NULL );
-						break;
-					case SDL_HAT_RIGHT:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qtrue, 0, NULL );
-						break;
-					case SDL_HAT_DOWN:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qtrue, 0, NULL );
-						break;
-					case SDL_HAT_LEFT:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qtrue, 0, NULL );
-						break;
-					case SDL_HAT_RIGHTUP:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qtrue, 0, NULL );
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qtrue, 0, NULL );
-						break;
-					case SDL_HAT_RIGHTDOWN:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qtrue, 0, NULL );
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 1], qtrue, 0, NULL );
-						break;
-					case SDL_HAT_LEFTUP:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 0], qtrue, 0, NULL );
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qtrue, 0, NULL );
-						break;
-					case SDL_HAT_LEFTDOWN:
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 2], qtrue, 0, NULL );
-						Com_QueueEvent( in_eventTime, SE_KEY, hat_keys[4*i + 3], qtrue, 0, NULL );
-						break;
-					default:
-						break;
-				}
-			}
-		}
-	}
-
-	// save hat state
-	stick_state.oldhats = hats;
-
-	// finally, look at the axes...
-	total = SDL_JoystickNumAxes(stick);
-	if (total > 0)
-	{
-		if (in_joystickUseAnalog->integer)
-		{
-			if (total > MAX_JOYSTICK_AXIS) total = MAX_JOYSTICK_AXIS;
-			for (i = 0; i < total; i++)
-			{
-				Sint16 axis = SDL_JoystickGetAxis(stick, i);
-				float f = ( (float) abs(axis) ) / 32767.0f;
-
-				if( f < in_joystickThreshold->value ) axis = 0;
-
-				if ( axis != stick_state.oldaaxes[i] )
-				{
-					Com_QueueEvent( in_eventTime, SE_JOYSTICK_AXIS, i, axis, 0, NULL );
-					stick_state.oldaaxes[i] = axis;
-				}
-			}
-		}
-		else
-		{
-			if (total > 16) total = 16;
-			for (i = 0; i < total; i++)
-			{
-				Sint16 axis = SDL_JoystickGetAxis(stick, i);
-				float f = ( (float) axis ) / 32767.0f;
-				if( f < -in_joystickThreshold->value ) {
-					axes |= ( 1 << ( i * 2 ) );
-				} else if( f > in_joystickThreshold->value ) {
-					axes |= ( 1 << ( ( i * 2 ) + 1 ) );
-				}
-			}
-		}
-	}
-
-	/* Time to update axes state based on old vs. new. */
-	if (axes != stick_state.oldaxes)
-	{
-		for( i = 0; i < 16; i++ ) {
-			if( ( axes & ( 1 << i ) ) && !( stick_state.oldaxes & ( 1 << i ) ) ) {
-				Com_QueueEvent( in_eventTime, SE_KEY, joy_keys[i], qtrue, 0, NULL );
-			}
-
-			if( !( axes & ( 1 << i ) ) && ( stick_state.oldaxes & ( 1 << i ) ) ) {
-				Com_QueueEvent( in_eventTime, SE_KEY, joy_keys[i], qfalse, 0, NULL );
-			}
-		}
-	}
-
-	/* Save for future generations. */
-	stick_state.oldaxes = axes;
-}
-
-/*
-===============
 IN_ProcessEvents
 ===============
 */
@@ -1234,12 +1223,6 @@ static void IN_ProcessEvents( void )
 				}
 				break;
 
-			case SDL_CONTROLLERDEVICEADDED:
-			case SDL_CONTROLLERDEVICEREMOVED:
-				if (in_joystick->integer)
-					IN_InitJoystick();
-				break;
-
 			case SDL_QUIT:
 				Cbuf_ExecuteText(EXEC_NOW, "quit Closed window\n");
 				break;
@@ -1294,103 +1277,97 @@ static void IN_ProcessEvents( void )
 
 /*
 ===============
-IN_InitGyro
-===============
-*/
-void IN_InitGyro( void )
-{
-
-padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-padInitializeDefault(&pad);
-
-hidGetSixAxisSensorHandles(&sixaxis_handles[0], 1, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld);
-hidGetSixAxisSensorHandles(&sixaxis_handles[1], 1, HidNpadIdType_No1,      HidNpadStyleTag_NpadFullKey);
-hidGetSixAxisSensorHandles(&sixaxis_handles[2], 2, HidNpadIdType_No1,      HidNpadStyleTag_NpadJoyDual);
-hidStartSixAxisSensor(sixaxis_handles[0]);
-hidStartSixAxisSensor(sixaxis_handles[1]);
-hidStartSixAxisSensor(sixaxis_handles[2]);
-hidStartSixAxisSensor(sixaxis_handles[3]);
-}
-
-
-/*
-===============
 IN_ProcessGyro
+
+Gyro aiming from the pad currently in use. Angular velocity is integrated
+over the real frame time, so sensitivity no longer changes with framerate
+(the scale is 1.0 at 60 fps, which keeps existing sensitivity settings).
 ===============
 */
-void IN_ProcessGyro( void )
+static void IN_ProcessGyro( int frameMsec )
 {
-	padUpdate(&pad);
-  if( in_gyromouse->integer ) {
-		HidSixAxisSensorState sixaxis = { 0 };
-				const u64 style_set = padGetStyleSet(&pad);
-				const u64 attrib = padGetAttributes(&pad);
-				if (style_set & HidNpadStyleTag_NpadHandheld)
-				hidGetSixAxisSensorStates(sixaxis_handles[0], &sixaxis, 1);
-				else if (style_set & HidNpadStyleTag_NpadFullKey)
-				hidGetSixAxisSensorStates(sixaxis_handles[1], &sixaxis, 1);
-				else if (style_set & HidNpadStyleTag_NpadJoyDual)
-				// For JoyDual, read from either the Left or Right Joy-Con depending on which is/are connected
-//            if (attrib & HidNpadAttribute_IsLeftConnected)
-//                hidGetSixAxisSensorStates(sixaxis_handles[2], &sixaxis, 1);
-            if (attrib & HidNpadAttribute_IsRightConnected)
-                hidGetSixAxisSensorStates(sixaxis_handles[3], &sixaxis, 1);
-								// Test for dual controllers.
-								if (attrib & HidNpadJoyAssignmentMode_Dual)
-		                hidGetSixAxisSensorStates(sixaxis_handles[2,3], &sixaxis, 1);
+	static float remX = 0.0f, remY = 0.0f;
+	HidSixAxisSensorState sixaxis;
+	HidSixAxisSensorHandle handle;
+	nxPad_t *p;
+	float pitch, yaw, scale, fx, fy;
+	int ix, iy, yawAxis;
 
-										// I'm surprised this works. I feel like it shouldn't since it looks too simple, but it works somehow so I'm not touching this any more than I have to. tl;dr this checks if you're in handheld mode or not and automatically switches yaw axis mode between roll (0) and yaw (1) - faithvoid
+	if( !in_gyromouse->integer || nx_activeSlot < 0 )
+	{
+		remX = remY = 0.0f;
+		return;
+	}
 
-										if (padIsHandheld(&pad))
-										{
-										Cvar_Set( "in_gyromouse_yaw_axis", "0" );
-										}
-										else
-										{
-										Cvar_Set( "in_gyromouse_yaw_axis", "1" );
-										}
+	p = &nx_pads[nx_activeSlot];
+	if( !p->style || !p->numSixaxis )
+		return;
 
+	// on a Joy-Con pair, aim with the right one if it is there
+	handle = p->sixaxis[0];
+	if( p->numSixaxis > 1 && ( padGetAttributes( &p->pad ) & HidNpadAttribute_IsRightConnected ) )
+		handle = p->sixaxis[1];
 
+	memset( &sixaxis, 0, sizeof( sixaxis ) );
+	if( hidGetSixAxisSensorStates( handle, &sixaxis, 1 ) == 0 )
+		return;
 
+	if ( in_gyromouse_debug->integer ) {
+		Com_Printf("Pad slot %d (%s)\n", nx_activeSlot, IN_NXStyleName( p->style ));
+		Com_Printf("Acceleration:     x=% .4f, y=% .4f, z=% .4f\n", sixaxis.acceleration.x, sixaxis.acceleration.y, sixaxis.acceleration.z);
+		Com_Printf("Angular velocity: x=% .4f, y=% .4f, z=% .4f\n", sixaxis.angular_velocity.x, sixaxis.angular_velocity.y, sixaxis.angular_velocity.z);
+		Com_Printf("Angle:            x=% .4f, y=% .4f, z=% .4f\n", sixaxis.angle.x, sixaxis.angle.y, sixaxis.angle.z);
+	}
 
-    if ( in_gyromouse_debug->integer ) {
-			Com_Printf("Acceleration:     x=% .4f, y=% .4f, z=% .4f\n", sixaxis.acceleration.x, sixaxis.acceleration.y, sixaxis.acceleration.z);
-			Com_Printf("Angular velocity: x=% .4f, y=% .4f, z=% .4f\n", sixaxis.angular_velocity.x, sixaxis.angular_velocity.y, sixaxis.angular_velocity.z);
-			Com_Printf("Angle:            x=% .4f, y=% .4f, z=% .4f\n", sixaxis.angle.x, sixaxis.angle.y, sixaxis.angle.z);
-			Com_Printf("Direction matrix:\n"
-						 "                  [ % .4f,   % .4f,   % .4f ]\n"
-						 "                  [ % .4f,   % .4f,   % .4f ]\n"
-						 "                  [ % .4f,   % .4f,   % .4f ]\n",
-						 sixaxis.direction.direction[0][0], sixaxis.direction.direction[1][0], sixaxis.direction.direction[2][0],
-             sixaxis.direction.direction[0][1], sixaxis.direction.direction[1][1], sixaxis.direction.direction[2][1],
-             sixaxis.direction.direction[0][2], sixaxis.direction.direction[1][2], sixaxis.direction.direction[2][2]);
-    }
+	// Handheld is held upright so yaw is around .y; a controller lies flat so
+	// yaw is around .z. in_gyromouse_yaw_auto 0 leaves the choice to
+	// in_gyromouse_yaw_axis.
+	if( in_gyromouse_yaw_auto->integer )
+		yawAxis = ( p->style == HidNpadStyleTag_NpadHandheld ) ? 0 : 1;
+	else
+		yawAxis = in_gyromouse_yaw_axis->integer;
 
-    float pitch = sixaxis.angular_velocity.x;
-    float yaw = in_gyromouse_yaw_axis->integer ? sixaxis.angular_velocity.z : sixaxis.angular_velocity.y;
-    if( clc.state == CA_DISCONNECTED || clc.state == CA_CINEMATIC || ( Key_GetCatcher( ) & KEYCATCH_UI ) ) {
-      pitch *= in_gyromouse_pitch_ui->value;
-      yaw *= in_gyromouse_yaw_ui->value;
-    } else {
-      pitch *= in_gyromouse_pitch->value;
-      yaw *= in_gyromouse_yaw->value;
-    }
+	if( p->style == HidNpadStyleTag_NpadJoyLeft )
+	{
+		// sideways: the Joy-Con's long axis is now the pitch axis
+		pitch = -sixaxis.angular_velocity.y;
+		yaw = sixaxis.angular_velocity.z;
+	}
+	else if( p->style == HidNpadStyleTag_NpadJoyRight )
+	{
+		pitch = sixaxis.angular_velocity.y;
+		yaw = sixaxis.angular_velocity.z;
+	}
+	else
+	{
+		pitch = sixaxis.angular_velocity.x;
+		yaw = yawAxis ? sixaxis.angular_velocity.z : sixaxis.angular_velocity.y;
+	}
 
-    Com_QueueEvent( in_eventTime, SE_MOUSE, yaw, pitch, 0, NULL );
-  }
-}
+	if( clc.state == CA_DISCONNECTED || clc.state == CA_CINEMATIC || ( Key_GetCatcher( ) & KEYCATCH_UI ) ) {
+		pitch *= in_gyromouse_pitch_ui->value;
+		yaw *= in_gyromouse_yaw_ui->value;
+	} else {
+		pitch *= in_gyromouse_pitch->value;
+		yaw *= in_gyromouse_yaw->value;
+	}
 
-/*
-===============
-IN_ShutdownGyro
-===============
-*/
-void IN_ShutdownGyro( void )
-{
-	hidStopSixAxisSensor(sixaxis_handles[0]);
-	hidStopSixAxisSensor(sixaxis_handles[1]);
-	hidStopSixAxisSensor(sixaxis_handles[2]);
-	hidStopSixAxisSensor(sixaxis_handles[3]);
+	if( frameMsec < 1 )
+		frameMsec = 1;
+	if( frameMsec > 100 )
+		frameMsec = 100;
+	scale = (float)frameMsec * ( 60.0f / 1000.0f );
+
+	// carry the fractional part so slow, precise movements aren't truncated away
+	fx = yaw * scale + remX;
+	fy = pitch * scale + remY;
+	ix = (int)fx;
+	iy = (int)fy;
+	remX = fx - (float)ix;
+	remY = fy - (float)iy;
+
+	if( ix || iy )
+		Com_QueueEvent( in_eventTime, SE_MOUSE, ix, iy, 0, NULL );
 }
 
 
@@ -1401,9 +1378,11 @@ IN_Frame
 */
 void IN_Frame( void )
 {
+	static int lastFrameTime = 0;
 	qboolean loading;
+	int now;
 
-	IN_JoyMove( );
+	IN_GamepadMove( );
 
 	// If not DISCONNECTED (main menu) or ACTIVE (in game), we're loading
 	loading = ( clc.state != CA_DISCONNECTED && clc.state != CA_ACTIVE );
@@ -1431,7 +1410,9 @@ void IN_Frame( void )
 
 	IN_ProcessEvents( );
 
-	IN_ProcessGyro( );
+	now = Sys_Milliseconds( );
+	IN_ProcessGyro( lastFrameTime ? now - lastFrameTime : 16 );
+	lastFrameTime = now;
 
 	// Set event time for next frame to earliest possible time an event could happen
 	in_eventTime = Sys_Milliseconds( );
@@ -1464,7 +1445,10 @@ void IN_Init( void *windowData )
 	Com_DPrintf( "\n------- Input Initialization -------\n" );
 
 	if (!in_mouse) // HACK: check if this wasn't already called
+	{
 		Cmd_AddCommand( "showosk", IN_ShowOSK_f );
+		Cmd_AddCommand( "controllers", IN_Controllers_f );
+	}
 
 	in_keyboardDebug = Cvar_Get( "in_keyboardDebug", "0", CVAR_ARCHIVE );
 
@@ -1475,6 +1459,7 @@ void IN_Init( void *windowData )
 	in_gyromouse = Cvar_Get( "in_gyromouse", "0", CVAR_ARCHIVE );
 	in_gyromouse_debug = Cvar_Get( "in_gyromouse_debug", "0", CVAR_ARCHIVE );
 	in_gyromouse_yaw_axis = Cvar_Get( "in_gyromouse_yaw_axis", "0", CVAR_ARCHIVE );
+	in_gyromouse_yaw_auto = Cvar_Get( "in_gyromouse_yaw_auto", "1", CVAR_ARCHIVE );
 	in_gyromouse_pitch = Cvar_Get( "in_gyromouse_pitch", "-10.0", CVAR_ARCHIVE );
 	in_gyromouse_yaw = Cvar_Get( "in_gyromouse_yaw", "-20.0", CVAR_ARCHIVE );
 	in_gyromouse_pitch_ui = Cvar_Get( "in_gyromouse_pitch_ui", "0.0", CVAR_ARCHIVE );
@@ -1482,6 +1467,8 @@ void IN_Init( void *windowData )
 
 	in_joystick = Cvar_Get( "in_joystick", "1", CVAR_ARCHIVE|CVAR_LATCH );
 	in_joystickThreshold = Cvar_Get( "joy_threshold", "0.15", CVAR_ARCHIVE );
+	in_joystickUseAnalog = Cvar_Get( "in_joystickUseAnalog", "1", CVAR_ARCHIVE );
+	in_joyconStickRotate = Cvar_Get( "in_joyconStickRotate", "1", CVAR_ARCHIVE );
 
 	mouseAvailable = ( in_mouse->value != 0 );
 	IN_DeactivateMouse( Cvar_VariableIntegerValue( "r_fullscreen" ) != 0 );
@@ -1490,9 +1477,7 @@ void IN_Init( void *windowData )
 	Cvar_SetValue( "com_unfocused",	!( appState & SDL_WINDOW_INPUT_FOCUS ) );
 	Cvar_SetValue( "com_minimized", appState & SDL_WINDOW_MINIMIZED );
 
-	IN_InitJoystick( );
-
-	IN_InitGyro( );
+	IN_InitPads( );
 
 	IN_InitKeys( );
 
@@ -1511,9 +1496,7 @@ void IN_Shutdown( void )
 	IN_DeactivateMouse( Cvar_VariableIntegerValue( "r_fullscreen" ) != 0 );
 	mouseAvailable = qfalse;
 
-	IN_ShutdownJoystick( );
-
-	IN_ShutdownGyro( );
+	IN_ShutdownPads( );
 
 	SDL_window = NULL;
 }
@@ -1525,7 +1508,6 @@ IN_Restart
 */
 void IN_Restart( void )
 {
-	IN_ShutdownJoystick( );
 	IN_Init( SDL_window );
 }
 
