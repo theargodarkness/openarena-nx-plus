@@ -1038,6 +1038,60 @@ static void IN_QueuePlayerEvent( int player, sysEventType_t type, int value, int
 
 /*
 ===============
+IN_DefaultPadBinds
+
+The game data's default.cfg only knows about keyboard and mouse, so a
+config without controller binds leaves every pad button dead in-game.
+If nothing at all is bound to the controller, set up the standard layout.
+A config that binds even one pad button is left exactly as it is.
+===============
+*/
+static void IN_DefaultPadBinds( void )
+{
+	static const struct { int key; const char *bind; } defaults[] = {
+		// K_PAD0_A is the bottom face button (B on a Switch pad), _B the right (A),
+		// _X the left (Y) and _Y the top (X)
+		{ K_PAD0_A,                "+moveup" },
+		{ K_PAD0_B,                "+attack" },
+		{ K_PAD0_X,                "+button3" },		// taunt
+		{ K_PAD0_Y,                "+button2" },		// use item
+		{ K_PAD0_BACK,             "+scores" },			// minus
+		{ K_PAD0_START,            "togglemenu" },		// plus
+		{ K_PAD0_LEFTSTICK_CLICK,  "vote no" },
+		{ K_PAD0_RIGHTSTICK_CLICK, "vote yes" },
+		{ K_PAD0_LEFTSHOULDER,     "+movedown" },
+		{ K_PAD0_RIGHTSHOULDER,    "weapnext" },
+		{ K_PAD0_DPAD_UP,          "+zoom" },
+		{ K_PAD0_DPAD_LEFT,        "weapprev" },
+		{ K_PAD0_DPAD_RIGHT,       "weapnext" },
+		{ K_PAD0_LEFTSTICK_UP,     "+forward" },
+		{ K_PAD0_LEFTSTICK_DOWN,   "+back" },
+		{ K_PAD0_LEFTSTICK_LEFT,   "+moveleft" },
+		{ K_PAD0_LEFTSTICK_RIGHT,  "+moveright" },
+		{ K_PAD0_RIGHTSTICK_UP,    "+lookup" },
+		{ K_PAD0_RIGHTSTICK_DOWN,  "+lookdown" },
+		{ K_PAD0_RIGHTSTICK_LEFT,  "+left" },
+		{ K_PAD0_RIGHTSTICK_RIGHT, "+right" },
+		{ K_PAD0_LEFTTRIGGER,      "+moveup" },
+		{ K_PAD0_RIGHTTRIGGER,     "+attack" }
+	};
+	int i;
+
+	for( i = K_PAD0_A; i <= K_PAD0_RIGHTTRIGGER; i++ )
+	{
+		const char *bind = Key_GetBinding( i );
+
+		if( bind && bind[0] )
+			return;
+	}
+
+	Com_Printf( "No controller binds found, using the default layout\n" );
+	for( i = 0; i < ARRAY_LEN( defaults ); i++ )
+		Key_SetBinding( defaults[i].key, defaults[i].bind );
+}
+
+/*
+===============
 IN_InitPads
 ===============
 */
@@ -1073,6 +1127,9 @@ static void IN_InitPads( void )
 	nx_pendingJoinSlot = -1;
 	nx_splitWasOn = qfalse;
 	nx_padsInitialized = qtrue;
+
+	// configs have been read by now
+	IN_DefaultPadBinds( );
 }
 
 /*
