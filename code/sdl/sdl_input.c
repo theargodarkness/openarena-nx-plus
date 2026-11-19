@@ -1280,3 +1280,15 @@ void IN_Restart( void )
 	IN_ShutdownJoystick( );
 	IN_Init( SDL_window );
 }
+
+/*
+===============
+IN_PromptControllers
+
+Only consoles have a system controller screen to show
+===============
+*/
+int IN_PromptControllers( void )
+{
+	return 0;
+}

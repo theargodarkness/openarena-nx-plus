@@ -58,6 +58,8 @@ static cvar_t *in_joystickThreshold = NULL;
 static cvar_t *in_joyconStickRotate = NULL; // rotate the stick of a sideways single Joy-Con
 static cvar_t *in_gyroSingleJoyCon  = NULL; // a lone Joy-Con always aims with its gyro
 static cvar_t *in_gyroSensitivity   = NULL; // scales gyro aiming in-game
+static cvar_t *in_gyroSensitivitySingle = NULL; // the same for a lone sideways Joy-Con
+static cvar_t *in_controllerPrompt  = NULL; // show the system controller screen when a local game starts
 static cvar_t *in_joyconStickTurn   = NULL; // a lone Joy-Con's stick turns left/right instead of strafing
 static cvar_t *in_padDebug          = NULL; // print what every pad reports and what it is turned into
 static cvar_t *in_padJoin           = NULL; // holding L+R / SL+SR on a spare pad adds a split-screen player
@@ -504,6 +506,8 @@ typedef struct
 	qboolean anyButton;
 	qboolean joinHeld;						// L+R / SL+SR are down
 	int joinHoldStart;
+	int splitSide;							// Joy-Con pair: 1 = SL+SR down on the left one, 2 = on the right one
+	int splitHoldStart;
 	u64 debugDown;							// last raw buttons printed by in_padDebug
 } nxPad_t;
 
@@ -523,6 +527,7 @@ static qboolean nx_splitWasOn = qfalse;
 static int nx_homeSlot = -1;				// pad the first player was last seen using
 static int nx_pendingJoinSlot = -1;			// pad that asked for a new player to be added
 static int nx_pendingJoinTime = 0;
+static int nx_promptPlayers = 0;			// players the controller screen set up for the game now starting
 
 // Indexed by SDL_CONTROLLER_BUTTON_*, which is what K_PAD0_A + i and the
 // existing binds expect. This reproduces the switch-sdl2 layout the port has
@@ -615,6 +620,7 @@ static void IN_NXPadChanged( nxPad_t *p, int slot, u32 style )
 
 	p->style = style;
 	p->joinHoldStart = 0;
+	p->splitHoldStart = 0;
 	if( !style )
 		return;
 
@@ -689,6 +695,14 @@ static void IN_NXReadPad( nxPad_t *p )
 		axes[SDL_CONTROLLER_AXIS_TRIGGERLEFT]  = ( down & HidNpadButton_ZL ) ? 32767 : 0;
 		axes[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] = ( down & HidNpadButton_ZR ) ? 32767 : 0;
 		p->joinHeld = ( down & HidNpadButton_L ) && ( down & HidNpadButton_R );
+
+		if( p->style == HidNpadStyleTag_NpadJoyDual )
+		{
+			if( ( down & HidNpadButton_LeftSL ) && ( down & HidNpadButton_LeftSR ) )
+				p->splitSide = 1;
+			else if( ( down & HidNpadButton_RightSL ) && ( down & HidNpadButton_RightSR ) )
+				p->splitSide = 2;
+		}
 	}
 
 	// With one stick there is nothing to turn with, so by default it works
@@ -758,6 +772,7 @@ static void IN_NXPollPads( void )
 		memset( p->buttons, 0, sizeof( p->buttons ) );
 		memset( p->axes, 0, sizeof( p->axes ) );
 		p->active = p->anyButton = p->joinHeld = qfalse;
+		p->splitSide = 0;
 
 		padUpdate( &p->pad );
 		style = padIsConnected( &p->pad ) ? IN_NXPrimaryStyle( padGetStyleSet( &p->pad ) ) : 0;
@@ -772,6 +787,8 @@ static void IN_NXPollPads( void )
 
 		if( !p->joinHeld )
 			p->joinHoldStart = 0;
+		if( !p->splitSide )
+			p->splitHoldStart = 0;
 	}
 }
 
@@ -860,8 +877,42 @@ static void IN_NXAssignPads( void )
 	if( nx_pendingJoinSlot >= 0 && now - nx_pendingJoinTime > NX_JOIN_TIMEOUT_MSEC )
 		nx_pendingJoinSlot = -1;
 
+	// Two detached Joy-Cons are one controller until told otherwise. Holding
+	// SL+SR on one of them breaks the pair up: that Joy-Con becomes a sideways
+	// controller of its own (and can then join as a player), the other stays.
+	if( in_padJoin->integer && com_sv_running->integer && CL_LocalClientState( 0 ) == CA_ACTIVE && Key_GetCatcher( ) == 0 )
+	{
+		for( slot = 0; slot < NX_MAX_PLAYERS; slot++ )
+		{
+			nxPad_t *p = &nx_pads[slot];
+
+			if( !p->splitSide )
+				continue;
+
+			if( !p->splitHoldStart )
+			{
+				p->splitHoldStart = now ? now : 1;
+			}
+			else if( now - p->splitHoldStart >= NX_JOIN_HOLD_MSEC )
+			{
+				// the Joy-Con that was NOT squeezed keeps this slot
+				HidNpadJoyDeviceType keep = ( p->splitSide == 1 ) ? HidNpadJoyDeviceType_Right : HidNpadJoyDeviceType_Left;
+				Result rc = hidSetNpadJoyAssignmentModeSingle( p->id, keep );
+
+				p->splitHoldStart = 0;
+				if( R_SUCCEEDED( rc ) )
+					Com_Printf( "Controller %d: Joy-Con pair split in two. Keep holding SL+SR to join.\n", slot + 1 );
+				else
+					Com_Printf( "Controller %d: could not split the Joy-Con pair (0x%x)\n", slot + 1, (unsigned int)rc );
+			}
+		}
+	}
+
 	if( !split )
 	{
+		if( CL_LocalClientState( 0 ) == CA_ACTIVE )
+			nx_promptPlayers = 0;	// a one-player game is running; the prompt's order is spent
+
 		if( nx_splitWasOn )
 		{
 			for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
@@ -913,7 +964,20 @@ static void IN_NXAssignPads( void )
 		nx_splitWasOn = qtrue;
 		for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
 			nx_pads[slot].player = -1;
-		if( nx_homeSlot >= 0 && nx_pads[nx_homeSlot].style && nx_homeSlot != nx_pendingJoinSlot )
+
+		if( nx_promptPlayers > 0 )
+		{
+			// the controller screen put the players in order: controller 1
+			// is player 1, and so on
+			player = 0;
+			for( slot = 0; slot < NX_MAX_PLAYERS && player < numPlayers; slot++ )
+			{
+				if( nx_pads[slot].style )
+					IN_NXClaimSeat( slot, player++ );
+			}
+			nx_promptPlayers = 0;
+		}
+		else if( nx_homeSlot >= 0 && nx_pads[nx_homeSlot].style && nx_homeSlot != nx_pendingJoinSlot )
 			IN_NXClaimSeat( nx_homeSlot, 0 );
 	}
 
@@ -1161,6 +1225,65 @@ static void IN_ShutdownPads( void )
 		IN_NXStopSixAxis( &nx_pads[i] );
 		nx_pads[i].style = 0;	// sensors get restarted if we come back up
 	}
+}
+
+/*
+===============
+IN_PromptControllers
+
+Called when a local game is about to start. Shows the system controller
+screen, where everyone presses L+R (or SL+SR to hold a Joy-Con sideways),
+so nobody has to leave the game to change grip and order. Returns how many
+players were set up there, or 0 if the screen was not shown.
+
+It is skipped with the Joy-Cons attached: that is one player on the
+console itself, and the system screen would insist on detaching them.
+===============
+*/
+int IN_PromptControllers( void )
+{
+	HidLaControllerSupportArg args;
+	HidLaControllerSupportResultInfo info;
+	nxPad_t *handheld = &nx_pads[NX_SLOT_HANDHELD];
+	Result rc;
+	int count, i;
+
+	nx_promptPlayers = 0;
+
+	if( !nx_padsInitialized || !in_controllerPrompt->integer )
+		return 0;
+
+	padUpdate( &handheld->pad );
+	if( padIsConnected( &handheld->pad ) )
+		return 0;
+
+	hidLaCreateControllerSupportArg( &args );
+	args.hdr.player_count_min = 1;
+	args.hdr.player_count_max = NX_MAX_PLAYERS;
+
+	memset( &info, 0, sizeof( info ) );
+	rc = hidLaShowControllerSupportForSystem( &info, &args, false );
+	if( R_FAILED( rc ) )
+	{
+		Com_Printf( "Controller screen not available (0x%x)\n", (unsigned int)rc );
+		return 0;
+	}
+
+	count = info.player_count;
+	if( count < 1 )
+		count = 1;
+	if( count > NX_MAX_PLAYERS )
+		count = NX_MAX_PLAYERS;
+
+	// seats are handed out again, in the order chosen on that screen
+	for( i = 0; i < NX_NUM_SLOTS; i++ )
+		nx_pads[i].player = -1;
+	nx_splitWasOn = qfalse;
+	nx_pendingJoinSlot = -1;
+	nx_promptPlayers = count;
+
+	Com_Printf( "%d controller(s) set up\n", count );
+	return count;
 }
 
 /*
@@ -1895,8 +2018,11 @@ static void IN_ProcessGyro( int player, int frameMsec )
 		pitch *= in_gyromouse_pitch_ui->value;
 		yaw *= in_gyromouse_yaw_ui->value;
 	} else {
-		pitch *= in_gyromouse_pitch->value * in_gyroSensitivity->value;
-		yaw *= in_gyromouse_yaw->value * in_gyroSensitivity->value;
+		// a sideways Joy-Con is held and moved differently, so it has its own setting
+		float sens = IN_NXIsSingleJoyCon( p->style ) ? in_gyroSensitivitySingle->value : in_gyroSensitivity->value;
+
+		pitch *= in_gyromouse_pitch->value * sens;
+		yaw *= in_gyromouse_yaw->value * sens;
 	}
 
 	if( frameMsec < 1 )
@@ -2021,6 +2147,8 @@ void IN_Init( void *windowData )
 	in_padJoin = Cvar_Get( "in_padJoin", "1", CVAR_ARCHIVE );
 	in_gyroSensitivity = Cvar_Get( "in_gyroSensitivity", "1", CVAR_ARCHIVE );
 	in_joyconStickTurn = Cvar_Get( "in_joyconStickTurn", "1", CVAR_ARCHIVE );
+	in_gyroSensitivitySingle = Cvar_Get( "in_gyroSensitivitySingle", "1", CVAR_ARCHIVE );
+	in_controllerPrompt = Cvar_Get( "in_controllerPrompt", "1", CVAR_ARCHIVE );
 	in_padDebug = Cvar_Get( "in_padDebug", "0", CVAR_TEMP );
 
 	mouseAvailable = ( in_mouse->value != 0 );

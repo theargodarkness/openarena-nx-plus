@@ -43,8 +43,10 @@ static const padMenuItem_t padMenuItems[] = {
 	{ "Invert stick aim",         "j_lookInvert",       "0",    0, 1, 1, qtrue },
 	{ "Stick dead zone",          "joy_threshold",      "0.15", 0.05f, 0.5f, 0.05f, qfalse },
 	{ "Gyro aiming",              "in_gyromouse",       "0",    0, 1, 1, qtrue },
-	{ "Gyro sensitivity",         "in_gyroSensitivity", "1",    0.1f,  4.0f, 0.1f,  qfalse },
+	{ "Gyro sensitivity (controller)", "in_gyroSensitivity",       "1", 0.1f, 4.0f, 0.1f, qfalse },
+	{ "Gyro sensitivity (single Joy-Con)", "in_gyroSensitivitySingle", "1", 0.1f, 4.0f, 0.1f, qfalse },
 	{ "Single Joy-Con: stick turns", "in_joyconStickTurn", "1", 0, 1, 1, qtrue },
+	{ "Controller screen at game start", "in_controllerPrompt", "1", 0, 1, 1, qtrue },
 };
 
 #define NUM_PADMENU_ITEMS	( (int)ARRAY_LEN( padMenuItems ) )
@@ -160,7 +162,7 @@ void CL_PadMenuDraw( void ) {
 	const int		boxH = 76 + NUM_PADMENU_ITEMS * rowHeight;
 	const int		boxX = ( SCREEN_WIDTH - boxW ) / 2;
 	const int		boxY = ( SCREEN_HEIGHT - boxH ) / 2;
-	const int		barX = boxX + 300, barW = 150;
+	const int		barX = boxX + 316, barW = 134;
 	int				i, y;
 
 	if ( !padMenuActive ) {

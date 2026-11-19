@@ -299,6 +299,8 @@ qboolean	CL_PadMenuActive( void );
 qboolean	CL_PadMenuKey( int key, qboolean down );
 void		CL_PadMenuDraw( void );
 void		CL_PadMenu_f( void );
+
+int			IN_PromptControllers( void );	// sdl_input*.c
 void		CL_AddPlayerCommandText( int player, const char *text );
 extern	qboolean	cl_dropLocalClient[MAX_LOCAL_CLIENTS];
 extern	qboolean	cl_worldMapLoaded;
