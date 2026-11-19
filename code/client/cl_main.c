@@ -1843,6 +1843,17 @@ void CL_MapLoading( void ) {
 		// clear nextmap so the cinematic shutdown doesn't execute it
 		Cvar_Set( "nextmap", "" );
 		CL_Disconnect( qtrue );
+
+		// A new local game: let everyone pick up a controller first. However
+		// many players are set up there is how many play.
+		{
+			int players = IN_PromptControllers();
+
+			if ( players > 0 ) {
+				Cvar_Set( "cl_splitscreen", va( "%d", players ) );
+			}
+		}
+
 		// the extra local clients join once the primary is in the game
 		CL_SetNumLocalClients( cl_splitscreen->integer );
 		Q_strncpyz( clc.servername, "localhost", sizeof(clc.servername) );
