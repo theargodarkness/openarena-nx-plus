@@ -541,22 +541,26 @@ static const u64 nx_buttonsFull[NX_NUM_BUTTONS] = {
 	HidNpadButton_Up, HidNpadButton_Down, HidNpadButton_Left, HidNpadButton_Right
 };
 
-// Single Joy-Con held sideways: face buttons keep their positions (bottom
-// button is still the "A" slot), stick click is start, SL/SR are the
-// triggers, and the two buttons on the end are the shoulders.
+// Single Joy-Con held sideways. With one stick and four face buttons the
+// layout is its own, expressed through the same keys so the binds are shared:
+//   bottom = "A" slot (jump)          right = "B" slot (fire)
+//   left   = right shoulder (next weapon)
+//   top    = guide (centre the view; nothing else uses that key)
+//   SL / SR = triggers (jump / fire)  stick click = start (menu)
+//   Minus/Plus = back (scores)        end buttons = crouch and use item
 static const u64 nx_buttonsJoyLeft[NX_NUM_BUTTONS] = {
-	HidNpadButton_Left, HidNpadButton_Down, HidNpadButton_Up, HidNpadButton_Right,
-	HidNpadButton_Minus, 0, HidNpadButton_StickL,
+	HidNpadButton_Left, HidNpadButton_Down, 0, HidNpadButton_ZL,
+	HidNpadButton_Minus, HidNpadButton_Right, HidNpadButton_StickL,
 	0, 0,
-	HidNpadButton_L, HidNpadButton_ZL,
+	HidNpadButton_L, HidNpadButton_Up,
 	0, 0, 0, 0
 };
 
 static const u64 nx_buttonsJoyRight[NX_NUM_BUTTONS] = {
-	HidNpadButton_A, HidNpadButton_X, HidNpadButton_B, HidNpadButton_Y,
-	HidNpadButton_Plus, 0, HidNpadButton_StickR,
+	HidNpadButton_A, HidNpadButton_X, 0, HidNpadButton_ZR,
+	HidNpadButton_Plus, HidNpadButton_Y, HidNpadButton_StickR,
 	0, 0,
-	HidNpadButton_R, HidNpadButton_ZR,
+	HidNpadButton_R, HidNpadButton_B,
 	0, 0, 0, 0
 };
 
@@ -979,9 +983,11 @@ static void IN_NXAssignPads( void )
 
 		if( nx_promptPlayers > 0 )
 		{
-			// the controller screen put the players in order: controller 1
-			// is player 1, and so on
+			// players in controller order: the console itself first if the
+			// Joy-Cons are attached, then controller 1, 2, ...
 			player = 0;
+			if( nx_pads[NX_SLOT_HANDHELD].style )
+				IN_NXClaimSeat( NX_SLOT_HANDHELD, player++ );
 			for( slot = 0; slot < NX_MAX_PLAYERS && player < numPlayers; slot++ )
 			{
 				if( nx_pads[slot].style )
@@ -1181,6 +1187,23 @@ static void IN_DefaultPadBinds( void )
 
 /*
 ===============
+IN_JoyConBinds
+
+The top face button of a sideways Joy-Con arrives as the "guide" key, which
+no other controller sends. Give it its job even in a config that already
+has controller binds, unless the player bound it to something.
+===============
+*/
+static void IN_JoyConBinds( void )
+{
+	const char *bind = Key_GetBinding( K_PAD0_GUIDE );
+
+	if( !bind || !bind[0] )
+		Key_SetBinding( K_PAD0_GUIDE, "centerview" );
+}
+
+/*
+===============
 IN_InitPads
 ===============
 */
@@ -1219,6 +1242,7 @@ static void IN_InitPads( void )
 
 	// configs have been read by now
 	IN_DefaultPadBinds( );
+	IN_JoyConBinds( );
 }
 
 /*
@@ -1257,7 +1281,7 @@ int IN_PromptControllers( void )
 {
 	HidLaControllerSupportArg args;
 	HidLaControllerSupportResultInfo info;
-	nxPad_t *handheld = &nx_pads[NX_SLOT_HANDHELD];
+	qboolean handheld;
 	Result rc;
 	int count, i;
 
@@ -1266,38 +1290,52 @@ int IN_PromptControllers( void )
 	if( !nx_padsInitialized || !in_controllerPrompt->integer )
 		return 0;
 
-	padUpdate( &handheld->pad );
-	if( padIsConnected( &handheld->pad ) )
-		return 0;
+	padUpdate( &nx_pads[NX_SLOT_HANDHELD].pad );
+	handheld = padIsConnected( &nx_pads[NX_SLOT_HANDHELD].pad ) ? qtrue : qfalse;
 
-	hidLaCreateControllerSupportArg( &args );
-	args.hdr.player_count_min = 1;
-	args.hdr.player_count_max = NX_MAX_PLAYERS;
-
-	// The plain call is the one applications normally use; the "for system"
-	// one is tried if it is refused.
-	memset( &info, 0, sizeof( info ) );
-	rc = hidLaShowControllerSupport( &info, &args );
-	if( R_FAILED( rc ) )
+	// With the Joy-Cons attached the system screen is not used: for more
+	// than one player it refuses to continue until they are detached. The
+	// console is player 1, and any other controllers that are connected
+	// play too.
+	if( !handheld )
 	{
+		hidLaCreateControllerSupportArg( &args );
+		args.hdr.player_count_min = 1;
+		args.hdr.player_count_max = NX_MAX_PLAYERS;
+
+		// The plain call is the one applications normally use; the "for system"
+		// one is tried if it is refused.
 		memset( &info, 0, sizeof( info ) );
-		rc = hidLaShowControllerSupportForSystem( &info, &args, false );
-	}
-	if( R_FAILED( rc ) )
-	{
-		// shown again once the game is on screen, where it can be read
-		nx_promptError = rc;
-		Com_Printf( "Controller screen not available (0x%x)\n", (unsigned int)rc );
-		return 0;
+		rc = hidLaShowControllerSupport( &info, &args );
+		if( R_FAILED( rc ) )
+		{
+			memset( &info, 0, sizeof( info ) );
+			rc = hidLaShowControllerSupportForSystem( &info, &args, false );
+		}
+		if( R_FAILED( rc ) )
+		{
+			// shown again once the game is on screen, where it can be read
+			nx_promptError = rc;
+			Com_Printf( "Controller screen not available (0x%x)\n", (unsigned int)rc );
+		}
 	}
 
-	count = info.player_count;
+	// Count who is there now. The system screen does not always appear (it
+	// stays away when it finds nothing to arrange) and its own count cannot
+	// be relied on then, so the connected controllers are what decides.
+	count = handheld ? 1 : 0;
+	for( i = 0; i < NX_MAX_PLAYERS; i++ )
+	{
+		padUpdate( &nx_pads[i].pad );
+		if( padIsConnected( &nx_pads[i].pad ) )
+			count++;
+	}
 	if( count < 1 )
 		count = 1;
 	if( count > NX_MAX_PLAYERS )
 		count = NX_MAX_PLAYERS;
 
-	// seats are handed out again, in the order chosen on that screen
+	// seats are handed out again, in controller order
 	for( i = 0; i < NX_NUM_SLOTS; i++ )
 		nx_pads[i].player = -1;
 	nx_splitWasOn = qfalse;
