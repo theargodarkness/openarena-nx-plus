@@ -1233,6 +1233,7 @@ qboolean			cl_dropLocalClient[MAX_LOCAL_CLIENTS];
 
 cvar_t				*cl_splitscreen;
 cvar_t				*cl_splitscreenVertical;
+cvar_t				*cl_hudScale;
 
 // userinfo keys a player other than the first can override, as p2_name,
 // p3_model and so on; an empty cvar means "same as player 1"
@@ -4275,6 +4276,7 @@ void CL_Init( void ) {
 	// split-screen
 	cl_splitscreen = Cvar_Get ("cl_splitscreen", "1", CVAR_ARCHIVE );
 	cl_splitscreenVertical = Cvar_Get ("cl_splitscreenVertical", "0", CVAR_ARCHIVE );
+	cl_hudScale = Cvar_Get ("cl_hudScale", "1", CVAR_ARCHIVE );
 	CL_InitLocalClientCvars();
 
 	Cvar_Get ("name", "UnnamedPlayer", CVAR_USERINFO | CVAR_ARCHIVE );

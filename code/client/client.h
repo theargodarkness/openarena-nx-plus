@@ -306,6 +306,7 @@ extern	qboolean	cl_dropLocalClient[MAX_LOCAL_CLIENTS];
 extern	qboolean	cl_worldMapLoaded;
 extern	cvar_t		*cl_splitscreen;
 extern	cvar_t		*cl_splitscreenVertical;
+extern	cvar_t		*cl_hudScale;
 
 /*
 ==================================================================

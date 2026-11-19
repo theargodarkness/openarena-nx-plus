@@ -425,8 +425,46 @@ static void CL_LoadWorldMap( const char *name ) {
 	cl_worldMapLoaded = qtrue;
 }
 
+/*
+====================
+CL_HudScale
+
+cl_hudScale shrinks everything the game draws in 2D (status bar, scores,
+crosshair, HUD models) towards the middle of the view. The game code lays
+its HUD out for the full screen and can't be asked to do otherwise, so
+this is done on its drawing as it passes through. Pictures that cover the
+whole view - damage flashes, backgrounds - are left alone.
+====================
+*/
+static float CL_HudScale( float w, float h ) {
+	float scale = cl_hudScale->value;
+
+	if ( scale >= 1.0f || clc.state != CA_ACTIVE ) {
+		return 1.0f;
+	}
+	if ( scale < 0.5f ) {
+		scale = 0.5f;
+	}
+	if ( w >= cls.glconfig.vidWidth * 0.9f && h >= cls.glconfig.vidHeight * 0.9f ) {
+		return 1.0f;
+	}
+	return scale;
+}
+
 static void CL_DrawStretchPic( float x, float y, float w, float h,
 		float s1, float t1, float s2, float t2, qhandle_t hShader ) {
+	float hud = CL_HudScale( w, h );
+
+	if ( hud != 1.0f ) {
+		float cx = cls.glconfig.vidWidth * 0.5f;
+		float cy = cls.glconfig.vidHeight * 0.5f;
+
+		x = cx + ( x - cx ) * hud;
+		y = cy + ( y - cy ) * hud;
+		w *= hud;
+		h *= hud;
+	}
+
 	if ( CL_SplitScreenActive() ) {
 		int		vx, vy, vw, vh;
 		float	sx, sy;
@@ -446,8 +484,26 @@ static void CL_DrawStretchPic( float x, float y, float w, float h,
 
 static void CL_RenderScene( const refdef_t *fd ) {
 	refdef_t	rd;
+	refdef_t	hudRd;
 	int			vx, vy, vw, vh;
 	float		sx, sy;
+
+	// models drawn as part of the HUD shrink with it
+	if ( ( fd->rdflags & RDF_NOWORLDMODEL ) && CL_HudScale( fd->width, fd->height ) != 1.0f ) {
+		float hud = CL_HudScale( fd->width, fd->height );
+		float cx = cls.glconfig.vidWidth * 0.5f;
+		float cy = cls.glconfig.vidHeight * 0.5f;
+
+		hudRd = *fd;
+		hudRd.x = (int)( cx + ( fd->x - cx ) * hud );
+		hudRd.y = (int)( cy + ( fd->y - cy ) * hud );
+		hudRd.width = (int)( fd->width * hud );
+		hudRd.height = (int)( fd->height * hud );
+		if ( hudRd.width < 1 || hudRd.height < 1 ) {
+			return;
+		}
+		fd = &hudRd;
+	}
 
 	if ( !CL_SplitScreenActive() ) {
 		re.RenderScene( fd );
