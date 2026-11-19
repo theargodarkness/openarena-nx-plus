@@ -1854,6 +1854,23 @@ void CL_MapLoading( void ) {
 			}
 		}
 
+		// Every local player needs a slot on the server. The single player
+		// game sizes the server for one human plus its bots, so make room
+		// there; elsewhere just make sure there are at least enough slots.
+		if ( cl_splitscreen->integer > 1 ) {
+			int			extra = cl_splitscreen->integer - 1;
+			qboolean	singlePlayer = ( Cvar_Get( "g_gametype", "0", 0 )->integer == 2 );
+			int			slots = Cvar_Get( "sv_maxclients", "8", 0 )->integer;
+			int			wanted = singlePlayer ? slots + extra : slots;
+
+			if ( wanted < extra + 1 ) {
+				wanted = extra + 1;
+			}
+			if ( wanted != slots ) {
+				Cvar_Set( "sv_maxclients", va( "%d", wanted ) );
+			}
+		}
+
 		// the extra local clients join once the primary is in the game
 		CL_SetNumLocalClients( cl_splitscreen->integer );
 		Q_strncpyz( clc.servername, "localhost", sizeof(clc.servername) );
