@@ -39,13 +39,21 @@ Gyro controls can be enabled from the controls section of the settings menu.
 - Right Stick In - Vote Yes
 
 
+## **Quake III Arena build**
+The same engine is also built as `Quake3NX.nro` for the original game. Put it in the same folder as OpenArenaNX and copy the `baseq3` folder from your own copy of Quake III Arena (pak0.pk3 to pak8.pk3) next to it. Every feature here works the same in both.
+
+## **Controller settings**
+Hold **Minus** for a second (Plus on a lone right Joy-Con), in a menu or in a game, to open the controller settings: stick aim speed and precision, invert, dead zone, gyro on/off and gyro sensitivity. Sticks and gyro stay live while it is open, so you can feel a change as you make it. `padsettings` in the console opens it too.
+
+A single sideways Joy-Con steers like the classics: stick forward/back moves, left/right turns, and the gyro aims. Turn `Single Joy-Con: stick turns` off there to strafe instead.
+
 ## **Split-screen**
 Up to four players on one console, each in their own part of the screen. It works with the stock OpenArena data and mods: every local player is a full client running the unmodified game code.
 
 - Host a game (skirmish or multiplayer), then **hold L+R for a second on another controller** (SL+SR on a sideways Joy-Con) to add a player. Press any button on a controller to take a free seat.
 - Or set the number of players yourself: `splitscreen 2` in the console (1 to 4). It applies straight away when hosting, otherwise on the next map.
 - Two players are stacked; `cl_splitscreenVertical 1` puts them side by side. Three and four players get a quarter each.
-- A single sideways Joy-Con moves with the stick and aims with the gyro. SL jumps, SR fires, and the two buttons on the end are crouch and next weapon. Use the `controllers` command to open the system controller screen and split a Joy-Con pair.
+- A single sideways Joy-Con moves and turns with the stick and aims with the gyro. SL jumps, SR fires, and the two buttons on the end are crouch and next weapon. Use the `controllers` command to open the system controller screen and split a Joy-Con pair.
 - `p2_name`, `p2_model`, `p2_headmodel` (and `p3_`, `p4_`) set name and model for the other players; binds are shared.
 - The server needs a free slot per player (`sv_maxclients`).
 - Sound is mixed for player 1. The others hear their own weapon and movement at full volume.
