@@ -291,6 +291,14 @@ int			CL_EventPlayer( void );
 void		CL_ShutdownCGames( void );
 void		CL_ClearLocalClientInput( int clientNum );
 const char	*CL_LocalClientMessage( int clientNum );
+
+//
+// cl_padmenu.c
+//
+qboolean	CL_PadMenuActive( void );
+qboolean	CL_PadMenuKey( int key, qboolean down );
+void		CL_PadMenuDraw( void );
+void		CL_PadMenu_f( void );
 void		CL_AddPlayerCommandText( int player, const char *text );
 extern	qboolean	cl_dropLocalClient[MAX_LOCAL_CLIENTS];
 extern	qboolean	cl_worldMapLoaded;
@@ -426,6 +434,9 @@ extern	cvar_t	*m_side;
 extern	cvar_t	*m_filter;
 
 extern	cvar_t	*j_pitch;
+extern	cvar_t	*j_lookSensitivity;
+extern	cvar_t	*j_lookCurve;
+extern	cvar_t	*j_lookInvert;
 extern	cvar_t	*j_yaw;
 extern	cvar_t	*j_forward;
 extern	cvar_t	*j_side;
@@ -603,6 +614,8 @@ void	SCR_DrawNamedPic( float x, float y, float width, float height, const char *
 
 void	SCR_DrawBigString( int x, int y, const char *s, float alpha, qboolean noColorEscape );			// draws a string with embedded color control characters with fade
 void	SCR_DrawBigStringColor( int x, int y, const char *s, vec4_t color, qboolean noColorEscape );	// ignores embedded color control characters
+void	SCR_DrawStringExt( int x, int y, float size, const char *string, float *setColor, qboolean forceColor,
+		qboolean noColorEscape );
 void	SCR_DrawSmallStringExt( int x, int y, const char *string, float *setColor, qboolean forceColor, qboolean noColorEscape );
 void	SCR_DrawSmallChar( int x, int y, int ch );
 

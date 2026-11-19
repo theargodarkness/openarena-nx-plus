@@ -16,12 +16,24 @@ include $(DEVKITPRO)/libnx/switch_rules
 # devkitPro template vars (TARGET, BUILD, SOURCES, DATA, INCLUDES, EXEFS_SRC, ROMFS, NO_ICON, NO_NACP).
 # APP_* fill the .nacp; ICON (.jpg) falls back to <TARGET>.jpg, icon.jpg, then the libnx default.
 #---------------------------------------------------------------------------------
-APP_TITLE	:=	OpenArenaNX
 APP_AUTHOR	:=	faithvoid
 APP_VERSION	:=	0.7.8
 
+# GAME selects what the NRO plays. Both are the same engine and features:
+#   openarena (default)  standalone, data in baseoa/
+#   quake3               Quake III Arena, needs the retail pak files in baseq3/
+GAME		?=	openarena
+ifeq ($(GAME),quake3)
+APP_TITLE	:=	Quake3NX
+TARGET		:=	Quake3NX
+BUILD		:=	build_q3
+GAME_DEFINES	:=
+else
+APP_TITLE	:=	OpenArenaNX
 TARGET		:=	OpenArenaNX
 BUILD		:=	build
+GAME_DEFINES	:=	-DOPENARENA -DSTANDALONE
+endif
 SOURCES		:=
 
 
@@ -138,6 +150,7 @@ SOURCEFILES	:= \
 	code/client/cl_net_chan.c \
 	code/client/cl_parse.c \
 	code/client/cl_scrn.c \
+	code/client/cl_padmenu.c \
 	code/client/cl_ui.c \
 	code/client/cl_avi.c \
 	\
@@ -280,7 +293,7 @@ endef
 VERSION		:=	1.36+3.00a
 DATA		:=	data
 INCLUDES	:=
-DEFINES		+=	-DOPENARENA -DSTANDALONE -DDEFAULT_BASEDIR=\"baseoa\" -DUSE_CURL -DUSE_CODEC_VORBIS -DUSE_CODEC_MP3 -DPRODUCT_VERSION=\"$(VERSION)\" -DARCH_STRING=\"aarch64\" \
+DEFINES		+=	$(GAME_DEFINES) -DDEFAULT_BASEDIR=\"baseoa\" -DUSE_CURL -DUSE_CODEC_VORBIS -DUSE_CODEC_MP3 -DPRODUCT_VERSION=\"$(VERSION)\" -DARCH_STRING=\"aarch64\" \
 				-DBOTLIB -DNO_VM_COMPILED -DUSE_OPENAL
 EXEFS_SRC	:=	exefs_src
 #ROMFS	:=	romfs

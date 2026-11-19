@@ -679,6 +679,35 @@ void CL_JoystickEvent( int axis, int value, int time ) {
 CL_JoystickMove
 =================
 */
+/*
+=================
+CL_JoystickLook
+
+Shapes stick aiming. "amount" is a stick deflection already multiplied by
+its scale; at full deflection that is the turn rate in degrees per second.
+j_lookCurve bends the response so small deflections aim finely while the
+full throw still turns fast, and j_lookSensitivity scales the result.
+=================
+*/
+static float CL_JoystickLook( float amount, float scale ) {
+	float full = fabs( scale ) * 32767.0f;
+	float frac;
+
+	if ( full <= 0.0f || amount == 0.0f ) {
+		return 0.0f;
+	}
+
+	frac = fabs( amount ) / full;
+	if ( frac > 1.0f ) {
+		frac = 1.0f;
+	}
+	if ( j_lookCurve->value > 1.0f ) {
+		frac = pow( frac, j_lookCurve->value );
+	}
+
+	return ( amount < 0.0f ? -full : full ) * frac * j_lookSensitivity->value;
+}
+
 void CL_JoystickMove( usercmd_t *cmd ) {
 	float	anglespeed;
 
@@ -699,7 +728,7 @@ void CL_JoystickMove( usercmd_t *cmd ) {
 	}
 
 	if ( !in_strafe.active ) {
-		cl.viewangles[YAW] += anglespeed * yaw;
+		cl.viewangles[YAW] += anglespeed * CL_JoystickLook( yaw, j_yaw->value );
 		cmd->rightmove = ClampChar( cmd->rightmove + (int)right );
 	} else {
 		cl.viewangles[YAW] += anglespeed * right;
@@ -710,7 +739,12 @@ void CL_JoystickMove( usercmd_t *cmd ) {
 		cl.viewangles[PITCH] += anglespeed * forward;
 		cmd->forwardmove = ClampChar( cmd->forwardmove + (int)pitch );
 	} else {
-		cl.viewangles[PITCH] += anglespeed * pitch;
+		float look = CL_JoystickLook( pitch, j_pitch->value );
+
+		if ( j_lookInvert->integer ) {
+			look = -look;
+		}
+		cl.viewangles[PITCH] += anglespeed * look;
 		cmd->forwardmove = ClampChar( cmd->forwardmove + (int)forward );
 	}
 

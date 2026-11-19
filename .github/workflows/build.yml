@@ -29,30 +29,38 @@ jobs:
       run: |
         printf '%s\n' "sha8=$(printf '%s\n' ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_OUTPUT
 
-    - name: Build OpenArenaNX (Switch 1)
-      run: make -f Makefile.nx -j$(nproc)
+    - name: Build OpenArenaNX and Quake3NX (Switch 1)
+      run: |
+        make -f Makefile.nx -j$(nproc)
+        make -f Makefile.nx -j$(nproc) GAME=quake3
 
     - name: Push Switch 1 NRO artifact
       uses: actions/upload-artifact@v4
       with:
-        name: openarenanx-switch1_${{ steps.slug.outputs.sha8 }}
-        path: OpenArenaNX.nro
+        name: switch1-nros_${{ steps.slug.outputs.sha8 }}
+        path: |
+          OpenArenaNX.nro
+          Quake3NX.nro
         if-no-files-found: error
 
     # The Switch 2 build comes second so that a problem with its SDK never
-    # costs the Switch 1 NRO above.
+    # costs the Switch 1 NROs above.
     - name: Install Ounce SDK
       run: |
         git clone https://github.com/ouncebrew/ounce-devkit.git /tmp/ounce-devkit
         cd /tmp/ounce-devkit
         sh install.sh
 
-    - name: Build OpenArenaNX (Switch 2)
-      run: make -f Makefile.nx2 -j$(nproc)
+    - name: Build OpenArenaNX and Quake3NX (Switch 2)
+      run: |
+        make -f Makefile.nx2 -j$(nproc)
+        make -f Makefile.nx2 -j$(nproc) GAME=quake3
 
     - name: Push Switch 2 NRO artifact
       uses: actions/upload-artifact@v4
       with:
-        name: openarenanx-switch2_${{ steps.slug.outputs.sha8 }}
-        path: OpenArenaNX_Switch2.nro
+        name: switch2-nros_${{ steps.slug.outputs.sha8 }}
+        path: |
+          OpenArenaNX_Switch2.nro
+          Quake3NX_Switch2.nro
         if-no-files-found: error

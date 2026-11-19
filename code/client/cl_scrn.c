@@ -587,6 +587,9 @@ void SCR_DrawScreenField( stereoFrame_t stereoFrame ) {
 	}
 
 	// console draws next
+	// controller settings go over game and menus, under the console
+	CL_PadMenuDraw();
+
 	Con_DrawConsole ();
 
 	// debug graph can be drawn on top of anything

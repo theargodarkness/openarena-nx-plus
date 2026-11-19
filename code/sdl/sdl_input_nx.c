@@ -57,6 +57,8 @@ static cvar_t *in_joystick          = NULL;
 static cvar_t *in_joystickThreshold = NULL;
 static cvar_t *in_joyconStickRotate = NULL; // rotate the stick of a sideways single Joy-Con
 static cvar_t *in_gyroSingleJoyCon  = NULL; // a lone Joy-Con always aims with its gyro
+static cvar_t *in_gyroSensitivity   = NULL; // scales gyro aiming in-game
+static cvar_t *in_joyconStickTurn   = NULL; // a lone Joy-Con's stick turns left/right instead of strafing
 static cvar_t *in_padDebug          = NULL; // print what every pad reports and what it is turned into
 static cvar_t *in_padJoin           = NULL; // holding L+R / SL+SR on a spare pad adds a split-screen player
 static cvar_t *in_joystickUseAnalog = NULL;
@@ -485,6 +487,7 @@ Who plays on which pad:
 #define NX_NUM_AXES      6						// SDL_CONTROLLER_AXIS_LEFTX..TRIGGERRIGHT
 #define NX_JOIN_HOLD_MSEC    1000
 #define NX_JOIN_TIMEOUT_MSEC 3000
+#define NX_SETTINGS_HOLD_MSEC 800
 
 typedef struct
 {
@@ -686,6 +689,15 @@ static void IN_NXReadPad( nxPad_t *p )
 		axes[SDL_CONTROLLER_AXIS_TRIGGERLEFT]  = ( down & HidNpadButton_ZL ) ? 32767 : 0;
 		axes[SDL_CONTROLLER_AXIS_TRIGGERRIGHT] = ( down & HidNpadButton_ZR ) ? 32767 : 0;
 		p->joinHeld = ( down & HidNpadButton_L ) && ( down & HidNpadButton_R );
+	}
+
+	// With one stick there is nothing to turn with, so by default it works
+	// like the classics: push forward/back to move, left/right to turn.
+	// Sideways deflection is handed to the look axis instead of strafing.
+	if( IN_NXIsSingleJoyCon( p->style ) && in_joyconStickTurn->integer )
+	{
+		r.x = l.x;
+		l.x = 0;
 	}
 
 	for( i = 0; i < NX_NUM_BUTTONS; i++ )
@@ -1416,12 +1428,73 @@ static void IN_MenuMove( const qboolean *playerChanged )
 			mousedx = p->axes[0];
 		if( abs( p->axes[1] ) > abs( mousedy ) )
 			mousedy = p->axes[1];
+		// a lone Joy-Con may be sending its sideways deflection as "turn"
+		if( IN_NXIsSingleJoyCon( p->style ) && abs( p->axes[2] ) > abs( mousedx ) )
+			mousedx = p->axes[2];
 	}
 
 	for( i = 0; i < NX_NUM_BUTTONS; i++ )
 	{
 		changed[i] = ( buttons[i] != nx_menuButtons[i] );
 		nx_menuButtons[i] = buttons[i];
+	}
+
+	// holding Minus (Plus on a lone right Joy-Con) opens the controller settings
+	{
+		static int holdStart = 0;
+		static qboolean fired = qfalse;
+		int now = Sys_Milliseconds( );
+
+		if( !buttons[SDL_CONTROLLER_BUTTON_BACK] )
+		{
+			holdStart = 0;
+			fired = qfalse;
+		}
+		else if( !holdStart )
+		{
+			holdStart = now ? now : 1;
+		}
+		else if( !fired && now - holdStart >= NX_SETTINGS_HOLD_MSEC )
+		{
+			fired = qtrue;
+			if( !CL_PadMenuActive( ) )
+				Cbuf_AddText( "padsettings\n" );
+		}
+	}
+
+	// the controller settings screen is driven with the d-pad or the stick
+	if( CL_PadMenuActive( ) )
+	{
+		static const int dirKeys[4] = { K_UPARROW, K_DOWNARROW, K_LEFTARROW, K_RIGHTARROW };
+		static qboolean dirHeld[4];
+		static int dirRepeat[4];
+		qboolean dir[4];
+		int now = Sys_Milliseconds( );
+
+		dir[0] = buttons[SDL_CONTROLLER_BUTTON_DPAD_UP]    || mousedy < -16000;
+		dir[1] = buttons[SDL_CONTROLLER_BUTTON_DPAD_DOWN]  || mousedy >  16000;
+		dir[2] = buttons[SDL_CONTROLLER_BUTTON_DPAD_LEFT]  || mousedx < -16000;
+		dir[3] = buttons[SDL_CONTROLLER_BUTTON_DPAD_RIGHT] || mousedx >  16000;
+
+		for( i = 0; i < 4; i++ )
+		{
+			if( dir[i] && ( !dirHeld[i] || now >= dirRepeat[i] ) )
+			{
+				// first press, then repeat while held
+				dirRepeat[i] = now + ( dirHeld[i] ? 110 : 400 );
+				Com_QueueEvent( in_eventTime, SE_KEY, dirKeys[i], qtrue, 0, NULL );
+				Com_QueueEvent( in_eventTime, SE_KEY, dirKeys[i], qfalse, 0, NULL );
+			}
+			dirHeld[i] = dir[i];
+		}
+
+		// A changes a setting, B or Plus closes the screen
+		if( changed[SDL_CONTROLLER_BUTTON_B] && buttons[SDL_CONTROLLER_BUTTON_B] )
+			Com_QueueEvent( in_eventTime, SE_KEY, K_ENTER, qtrue, 0, NULL );
+		if( ( changed[SDL_CONTROLLER_BUTTON_A] && buttons[SDL_CONTROLLER_BUTTON_A] )
+			|| ( changed[SDL_CONTROLLER_BUTTON_START] && buttons[SDL_CONTROLLER_BUTTON_START] ) )
+			Com_QueueEvent( in_eventTime, SE_KEY, K_ESCAPE, qtrue, 0, NULL );
+		return;
 	}
 
 	// HACK: in menus, also generate mouse events from some of the buttons and left analog
@@ -1822,8 +1895,8 @@ static void IN_ProcessGyro( int player, int frameMsec )
 		pitch *= in_gyromouse_pitch_ui->value;
 		yaw *= in_gyromouse_yaw_ui->value;
 	} else {
-		pitch *= in_gyromouse_pitch->value;
-		yaw *= in_gyromouse_yaw->value;
+		pitch *= in_gyromouse_pitch->value * in_gyroSensitivity->value;
+		yaw *= in_gyromouse_yaw->value * in_gyroSensitivity->value;
 	}
 
 	if( frameMsec < 1 )
@@ -1946,6 +2019,8 @@ void IN_Init( void *windowData )
 	in_joyconStickRotate = Cvar_Get( "in_joyconStickRotate", "1", CVAR_ARCHIVE );
 	in_gyroSingleJoyCon = Cvar_Get( "in_gyroSingleJoyCon", "1", CVAR_ARCHIVE );
 	in_padJoin = Cvar_Get( "in_padJoin", "1", CVAR_ARCHIVE );
+	in_gyroSensitivity = Cvar_Get( "in_gyroSensitivity", "1", CVAR_ARCHIVE );
+	in_joyconStickTurn = Cvar_Get( "in_joyconStickTurn", "1", CVAR_ARCHIVE );
 	in_padDebug = Cvar_Get( "in_padDebug", "0", CVAR_TEMP );
 
 	mouseAvailable = ( in_mouse->value != 0 );

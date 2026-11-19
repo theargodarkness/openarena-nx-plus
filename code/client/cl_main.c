@@ -94,6 +94,9 @@ cvar_t	*m_side;
 cvar_t	*m_filter;
 
 cvar_t	*j_pitch;
+cvar_t	*j_lookSensitivity;
+cvar_t	*j_lookCurve;
+cvar_t	*j_lookInvert;
 cvar_t	*j_yaw;
 cvar_t	*j_forward;
 cvar_t	*j_side;
@@ -4199,6 +4202,18 @@ void CL_Init( void ) {
 	m_filter = Cvar_Get ("m_filter", "0", CVAR_ARCHIVE);
 #endif
 
+	// Stick aiming: the j_pitch/j_yaw scales give 720 degrees a second at full
+	// deflection, far too fast to aim with on a pad, so consoles start slower
+	// and with a response curve. Desktop builds keep the old behaviour.
+#ifdef __SWITCH__
+	j_lookSensitivity = Cvar_Get ("j_lookSensitivity", "0.3", CVAR_ARCHIVE);
+	j_lookCurve =       Cvar_Get ("j_lookCurve",       "1.5", CVAR_ARCHIVE);
+#else
+	j_lookSensitivity = Cvar_Get ("j_lookSensitivity", "1", CVAR_ARCHIVE);
+	j_lookCurve =       Cvar_Get ("j_lookCurve",       "1", CVAR_ARCHIVE);
+#endif
+	j_lookInvert =      Cvar_Get ("j_lookInvert",      "0", CVAR_ARCHIVE);
+
 	j_pitch =        Cvar_Get ("j_pitch",        "0.022", CVAR_ARCHIVE);
 	j_yaw =          Cvar_Get ("j_yaw",          "-0.022", CVAR_ARCHIVE);
 	j_forward =      Cvar_Get ("j_forward",      "-0.25", CVAR_ARCHIVE);
@@ -4288,6 +4303,7 @@ void CL_Init( void ) {
 	Cmd_AddCommand ("vid_restart", CL_Vid_Restart_f);
 	Cmd_AddCommand ("splitscreen", CL_Splitscreen_f);
 	Cmd_AddCommand ("lp", CL_LocalPlayer_f);
+	Cmd_AddCommand ("padsettings", CL_PadMenu_f);
 	Cmd_AddCommand ("disconnect", CL_Disconnect_f);
 	Cmd_AddCommand ("record", CL_Record_f);
 	Cmd_AddCommand ("demo", CL_PlayDemo_f);
@@ -4365,6 +4381,7 @@ void CL_Shutdown(char *finalmsg, qboolean disconnect, qboolean quit)
 	Cmd_RemoveCommand ("vid_restart");
 	Cmd_RemoveCommand ("splitscreen");
 	Cmd_RemoveCommand ("lp");
+	Cmd_RemoveCommand ("padsettings");
 	Cmd_RemoveCommand ("disconnect");
 	Cmd_RemoveCommand ("record");
 	Cmd_RemoveCommand ("demo");
