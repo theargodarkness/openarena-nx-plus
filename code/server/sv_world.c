@@ -499,11 +499,31 @@ void SV_ClipToEntity( trace_t *trace, const vec3_t start, const vec3_t mins, con
 
 /*
 ====================
+SV_IsLocalHuman
+
+True for a player on this machine (a split-screen player), as opposed to
+a bot or someone on the network
+====================
+*/
+static qboolean SV_IsLocalHuman( int entityNum ) {
+	client_t *cl;
+
+	if ( entityNum < 0 || entityNum >= sv_maxclients->integer || !svs.clients ) {
+		return qfalse;
+	}
+
+	cl = &svs.clients[entityNum];
+	return cl->state >= CS_CONNECTED && cl->netchan.remoteAddress.type == NA_LOOPBACK;
+}
+
+/*
+====================
 SV_ClipMoveToEntities
 
 ====================
 */
 static void SV_ClipMoveToEntities( moveclip_t *clip ) {
+	qboolean	coopShot;
 	int			i, num;
 	int			touchlist[MAX_GENTITIES];
 	sharedEntity_t *touch;
@@ -513,6 +533,12 @@ static void SV_ClipMoveToEntities( moveclip_t *clip ) {
 	float		*origin, *angles;
 
 	num = SV_AreaEntities( clip->boxmins, clip->boxmaxs, touchlist, MAX_GENTITIES);
+
+	// A weapon trace (it wants bodies, and unlike player movement ignores
+	// player clips) fired by one of the split-screen players?
+	coopShot = !sv_splitscreenPvP->integer
+		&& ( clip->contentmask & CONTENTS_BODY ) && !( clip->contentmask & CONTENTS_PLAYERCLIP )
+		&& SV_IsLocalHuman( clip->passEntityNum );
 
 	if ( clip->passEntityNum != ENTITYNUM_NONE ) {
 		passOwnerNum = ( SV_GentityNum( clip->passEntityNum ) )->r.ownerNum;
@@ -544,6 +570,12 @@ static void SV_ClipMoveToEntities( moveclip_t *clip ) {
 
 		// if it doesn't have any brushes of a type we
 		// are looking for, ignore it
+		// co-op: shots and projectiles of one split-screen player pass
+		// through the others
+		if ( coopShot && SV_IsLocalHuman( touchlist[i] ) ) {
+			continue;
+		}
+
 		if ( ! ( clip->contentmask & touch->r.contents ) ) {
 			continue;
 		}

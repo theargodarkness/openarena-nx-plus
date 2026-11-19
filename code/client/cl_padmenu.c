@@ -47,6 +47,9 @@ static const padMenuItem_t padMenuItems[] = {
 	{ "Gyro sensitivity (single Joy-Con)", "in_gyroSensitivitySingle", "1", 0.1f, 4.0f, 0.1f, qfalse },
 	{ "Single Joy-Con: stick turns", "in_joyconStickTurn", "1", 0, 1, 1, qtrue },
 	{ "Controller screen at game start", "in_controllerPrompt", "1", 0, 1, 1, qtrue },
+	{ "2 players: side by side",  "cl_splitscreenVertical", "0", 0, 1, 1, qtrue },
+	{ "Players can hurt each other", "sv_splitscreenPvP", "1", 0, 1, 1, qtrue },
+	{ "Show controller debug info", "in_padDebug",     "0",    0, 1, 1, qtrue },
 };
 
 #define NUM_PADMENU_ITEMS	( (int)ARRAY_LEN( padMenuItems ) )
@@ -77,7 +80,8 @@ void CL_PadMenu_f( void ) {
 
 	if ( padMenuActive ) {
 		for ( i = 0; i < NUM_PADMENU_ITEMS; i++ ) {
-			Cvar_Get( padMenuItems[i].cvar, padMenuItems[i].def, CVAR_ARCHIVE );
+			// make sure it exists; whoever owns the cvar decides if it is saved
+			Cvar_Get( padMenuItems[i].cvar, padMenuItems[i].def, 0 );
 		}
 	}
 }
@@ -157,7 +161,7 @@ void CL_PadMenuDraw( void ) {
 	static vec4_t	textColor  = { 0.85f, 0.85f, 0.85f, 1.0f };
 	static vec4_t	selColor   = { 1.0f, 1.0f, 1.0f, 1.0f };
 	static vec4_t	titleColor = { 1.0f, 0.65f, 0.1f, 1.0f };
-	const int		rowHeight = 22;
+	const int		rowHeight = 20;
 	const int		boxW = 520;
 	const int		boxH = 76 + NUM_PADMENU_ITEMS * rowHeight;
 	const int		boxX = ( SCREEN_WIDTH - boxW ) / 2;
