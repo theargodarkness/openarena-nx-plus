@@ -527,6 +527,7 @@ static qboolean nx_splitWasOn = qfalse;
 static int nx_homeSlot = -1;				// pad the first player was last seen using
 static int nx_pendingJoinSlot = -1;			// pad that asked for a new player to be added
 static int nx_pendingJoinTime = 0;
+static Result nx_promptError = 0;			// why the controller screen could not be shown, 0 = it could
 static int nx_promptPlayers = 0;			// players the controller screen set up for the game now starting
 
 // Indexed by SDL_CONTROLLER_BUTTON_*, which is what K_PAD0_A + i and the
@@ -877,6 +878,14 @@ static void IN_NXAssignPads( void )
 	if( nx_pendingJoinSlot >= 0 && now - nx_pendingJoinTime > NX_JOIN_TIMEOUT_MSEC )
 		nx_pendingJoinSlot = -1;
 
+	if( nx_promptError && CL_LocalClientState( 0 ) == CA_ACTIVE )
+	{
+		Com_Printf( "The system controller screen could not be opened (0x%x).\n"
+			"It is not available when the game is started from the album.\n"
+			"Hold L+R on another controller to add a player instead.\n", (unsigned int)nx_promptError );
+		nx_promptError = 0;
+	}
+
 	// Two detached Joy-Cons are one controller until told otherwise. Holding
 	// SL+SR on one of them breaks the pair up: that Joy-Con becomes a sideways
 	// controller of its own (and can then join as a player), the other stays.
@@ -920,15 +929,17 @@ static void IN_NXAssignPads( void )
 		}
 		nx_splitWasOn = qfalse;
 
-		// remember which pad the player is really using; a pad asking to
-		// join doesn't count
-		for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
+		// The first pad to be used is the player's, and stays so until it is
+		// disconnected. (It must not follow whichever pad was touched last:
+		// pressing L a moment before R on a second pad would make that pad
+		// "the player's" and so unable to join.)
+		if( nx_homeSlot >= 0 && !nx_pads[nx_homeSlot].style )
+			nx_homeSlot = -1;
+		for( slot = 0; slot < NX_NUM_SLOTS && nx_homeSlot < 0; slot++ )
 		{
 			if( nx_pads[slot].active && !nx_pads[slot].joinHeld )
 				nx_homeSlot = slot;
 		}
-		if( nx_homeSlot >= 0 && !nx_pads[nx_homeSlot].style )
-			nx_homeSlot = -1;
 
 		for( slot = 0; slot < NX_NUM_SLOTS; slot++ )
 		{
@@ -944,6 +955,7 @@ static void IN_NXAssignPads( void )
 			{
 				nx_pendingJoinSlot = slot;
 				nx_pendingJoinTime = now;
+				Com_Printf( "Controller %d is joining as player 2\n", slot + 1 );
 				Cbuf_AddText( "splitscreen 2\n" );
 				break;
 			}
@@ -1031,6 +1043,7 @@ static void IN_NXAssignPads( void )
 		{
 			nx_pendingJoinSlot = slot;
 			nx_pendingJoinTime = now;
+			Com_Printf( "Controller %d is joining as player %d\n", slot + 1, numPlayers + 1 );
 			Cbuf_AddText( va( "splitscreen %d\n", numPlayers + 1 ) );
 			canJoin = qfalse;
 		}
@@ -1261,10 +1274,19 @@ int IN_PromptControllers( void )
 	args.hdr.player_count_min = 1;
 	args.hdr.player_count_max = NX_MAX_PLAYERS;
 
+	// The plain call is the one applications normally use; the "for system"
+	// one is tried if it is refused.
 	memset( &info, 0, sizeof( info ) );
-	rc = hidLaShowControllerSupportForSystem( &info, &args, false );
+	rc = hidLaShowControllerSupport( &info, &args );
 	if( R_FAILED( rc ) )
 	{
+		memset( &info, 0, sizeof( info ) );
+		rc = hidLaShowControllerSupportForSystem( &info, &args, false );
+	}
+	if( R_FAILED( rc ) )
+	{
+		// shown again once the game is on screen, where it can be read
+		nx_promptError = rc;
 		Com_Printf( "Controller screen not available (0x%x)\n", (unsigned int)rc );
 		return 0;
 	}
