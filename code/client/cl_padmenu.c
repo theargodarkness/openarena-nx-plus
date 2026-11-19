@@ -43,10 +43,12 @@ static const padMenuItem_t padMenuItems[] = {
 	{ "Invert stick aim",         "j_lookInvert",       "0",    0, 1, 1, qtrue },
 	{ "Stick dead zone",          "joy_threshold",      "0.15", 0.05f, 0.5f, 0.05f, qfalse },
 	{ "Gyro aiming",              "in_gyromouse",       "0",    0, 1, 1, qtrue },
-	{ "Gyro sensitivity (controller)", "in_gyroSensitivity",       "1", 0.1f, 4.0f, 0.1f, qfalse },
-	{ "Gyro sensitivity (single Joy-Con)", "in_gyroSensitivitySingle", "1", 0.1f, 4.0f, 0.1f, qfalse },
+	{ "Gyro sensitivity (controller)", "in_gyroSensitivity",       "1", 0.25f, 12.0f, 0.25f, qfalse },
+	{ "Gyro sensitivity (single Joy-Con)", "in_gyroSensitivitySingle", "1", 0.25f, 12.0f, 0.25f, qfalse },
 	{ "Single Joy-Con: stick turns", "in_joyconStickTurn", "1", 0, 1, 1, qtrue },
 	{ "Controller screen at game start", "in_controllerPrompt", "1", 0, 1, 1, qtrue },
+	{ "Field of view",            "cg_fov",             "90",   60.0f, 130.0f, 5.0f, qfalse },
+	{ "HUD size",                 "cl_hudScale",        "1",    0.5f, 1.0f, 0.05f, qfalse },
 	{ "2 players: side by side",  "cl_splitscreenVertical", "0", 0, 1, 1, qtrue },
 	{ "Players can hurt each other", "sv_splitscreenPvP", "1", 0, 1, 1, qtrue },
 	{ "Show controller debug info", "in_padDebug",     "0",    0, 1, 1, qtrue },
@@ -161,7 +163,7 @@ void CL_PadMenuDraw( void ) {
 	static vec4_t	textColor  = { 0.85f, 0.85f, 0.85f, 1.0f };
 	static vec4_t	selColor   = { 1.0f, 1.0f, 1.0f, 1.0f };
 	static vec4_t	titleColor = { 1.0f, 0.65f, 0.1f, 1.0f };
-	const int		rowHeight = 20;
+	const int		rowHeight = 19;
 	const int		boxW = 520;
 	const int		boxH = 76 + NUM_PADMENU_ITEMS * rowHeight;
 	const int		boxX = ( SCREEN_WIDTH - boxW ) / 2;

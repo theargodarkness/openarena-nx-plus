@@ -1281,7 +1281,7 @@ int IN_PromptControllers( void )
 {
 	HidLaControllerSupportArg args;
 	HidLaControllerSupportResultInfo info;
-	qboolean handheld;
+	qboolean handheld, docked;
 	Result rc;
 	int count, i;
 
@@ -1293,15 +1293,23 @@ int IN_PromptControllers( void )
 	padUpdate( &nx_pads[NX_SLOT_HANDHELD].pad );
 	handheld = padIsConnected( &nx_pads[NX_SLOT_HANDHELD].pad ) ? qtrue : qfalse;
 
-	// With the Joy-Cons attached the system screen is not used: for more
-	// than one player it refuses to continue until they are detached. The
-	// console is player 1, and any other controllers that are connected
-	// play too.
+	// In the dock the screen always comes up, Joy-Cons on the console or not.
+	// Undocked with the Joy-Cons attached it is not used: for more than one
+	// player it refuses to continue until they are detached. The console is
+	// player 1 then, and any other controllers that are connected play too.
+	docked = ( appletGetOperationMode( ) == AppletOperationMode_Console ) ? qtrue : qfalse;
+	if( docked )
+		handheld = qfalse;
+
 	if( !handheld )
 	{
 		hidLaCreateControllerSupportArg( &args );
 		args.hdr.player_count_min = 1;
 		args.hdr.player_count_max = NX_MAX_PLAYERS;
+		// Start from nobody connected, so that everyone presses L+R (or
+		// SL+SR) again. Otherwise the system skips the screen whenever the
+		// controllers already connected look acceptable to it.
+		args.hdr.enable_take_over_connection = 0;
 
 		// The plain call is the one applications normally use; the "for system"
 		// one is tried if it is refused.
