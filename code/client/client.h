@@ -307,6 +307,11 @@ extern	qboolean	cl_worldMapLoaded;
 extern	cvar_t		*cl_splitscreen;
 extern	cvar_t		*cl_splitscreenVertical;
 extern	cvar_t		*cl_hudScale;
+extern	cvar_t		*cl_enemyMarker;
+extern	cvar_t		*cl_hitMarker;
+int			CL_LocalClientNum( int clientNum );
+void		CL_MenuArtRegistered( const char *name );
+void		CL_MenuArtReset( void );
 
 /*
 ==================================================================

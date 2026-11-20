@@ -814,6 +814,7 @@ intptr_t CL_UISystemCalls( intptr_t *args ) {
 		return re.RegisterSkin( VMA(1) );
 
 	case UI_R_REGISTERSHADERNOMIP:
+		CL_MenuArtRegistered( VMA(1) );
 		return re.RegisterShaderNoMip( VMA(1) );
 
 	case UI_R_CLEARSCENE:
@@ -1126,6 +1127,7 @@ void CL_InitUI( void ) {
 	if (v == UI_OLD_API_VERSION) {
 //		Com_Printf(S_COLOR_YELLOW "WARNING: loading old Quake III Arena User Interface version %d\n", v );
 		// init for this gamestate
+		CL_MenuArtReset();
 		VM_Call( uivm, UI_INIT, (clc.state >= CA_AUTHORIZING && clc.state < CA_ACTIVE));
 	}
 	else if (v != UI_API_VERSION) {
