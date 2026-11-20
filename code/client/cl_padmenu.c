@@ -35,6 +35,7 @@ typedef struct {
 	const char	*def;		// used if nothing registered the cvar yet
 	float		min, max, step;
 	qboolean	toggle;
+	const char	*choices[4];	// for a setting with a few named values (0, 1, 2 ...)
 } padMenuItem_t;
 
 static const padMenuItem_t padMenuItems[] = {
@@ -51,6 +52,8 @@ static const padMenuItem_t padMenuItems[] = {
 	{ "HUD size",                 "cl_hudScale",        "1",    0.5f, 1.0f, 0.05f, qfalse },
 	{ "2 players: side by side",  "cl_splitscreenVertical", "0", 0, 1, 1, qtrue },
 	{ "Players can hurt each other", "sv_splitscreenPvP", "1", 0, 1, 1, qtrue },
+	{ "Highlight enemies",        "cl_enemyMarker",     "0",    0, 3, 1, qfalse, { "Off", "Red glow", "Red name", "Glow and name" } },
+	{ "Hit markers",              "cl_hitMarker",       "0",    0, 1, 1, qtrue },
 	{ "Show controller debug info", "in_padDebug",     "0",    0, 1, 1, qtrue },
 };
 
@@ -94,6 +97,14 @@ static void CL_PadMenuAdjust( int dir ) {
 
 	if ( item->toggle ) {
 		Cvar_Set( item->cvar, value ? "0" : "1" );
+		return;
+	}
+
+	if ( item->choices[0] ) {
+		int count = (int)item->max + 1;
+		int next = ( (int)value + ( dir > 0 ? 1 : count - 1 ) ) % count;
+
+		Cvar_Set( item->cvar, va( "%d", next ) );
 		return;
 	}
 
@@ -163,7 +174,7 @@ void CL_PadMenuDraw( void ) {
 	static vec4_t	textColor  = { 0.85f, 0.85f, 0.85f, 1.0f };
 	static vec4_t	selColor   = { 1.0f, 1.0f, 1.0f, 1.0f };
 	static vec4_t	titleColor = { 1.0f, 0.65f, 0.1f, 1.0f };
-	const int		rowHeight = 19;
+	const int		rowHeight = 18;
 	const int		boxW = 520;
 	const int		boxH = 76 + NUM_PADMENU_ITEMS * rowHeight;
 	const int		boxX = ( SCREEN_WIDTH - boxW ) / 2;
@@ -191,6 +202,13 @@ void CL_PadMenuDraw( void ) {
 
 		if ( item->toggle ) {
 			SCR_DrawStringExt( barX, y, 8, value ? "On" : "Off", color, qtrue, qfalse );
+		} else if ( item->choices[0] ) {
+			int choice = (int)value;
+
+			if ( choice < 0 || choice > (int)item->max ) {
+				choice = 0;
+			}
+			SCR_DrawStringExt( barX, y, 8, item->choices[choice], color, qtrue, qfalse );
 		} else {
 			float frac = ( value - item->min ) / ( item->max - item->min );
 

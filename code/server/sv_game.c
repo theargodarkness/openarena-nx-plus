@@ -284,6 +284,74 @@ static int	FloatAsInt( float f ) {
 
 /*
 ====================
+SV_CoopFilterSplash
+
+Co-op (sv_splitscreenPvP 0): splash damage. The game finds splash victims
+by asking for the entities in a cube around the explosion, and it does not
+say whose explosion it is. The projectile that caused it is still there
+though, at the centre of that cube, and it knows its owner. If the owner is
+a split-screen player, the other split-screen players are taken off the
+list; the owner stays on it, so rocket jumps still work.
+====================
+*/
+static qboolean SV_LocalHumanNum( int num ) {
+	client_t *cl;
+
+	if ( num < 0 || num >= sv_maxclients->integer || !svs.clients ) {
+		return qfalse;
+	}
+	cl = &svs.clients[num];
+	return cl->state >= CS_CONNECTED && cl->netchan.remoteAddress.type == NA_LOOPBACK;
+}
+
+static int SV_CoopFilterSplash( const float *mins, const float *maxs, int *list, int count ) {
+	vec3_t	centre, size;
+	int		owner = -1;
+	int		i, out;
+
+	if ( sv_splitscreenPvP->integer || count <= 0 ) {
+		return count;
+	}
+
+	// a splash query is a cube
+	VectorSubtract( maxs, mins, size );
+	if ( fabs( size[0] - size[1] ) > 0.5f || fabs( size[0] - size[2] ) > 0.5f ) {
+		return count;
+	}
+	centre[0] = ( mins[0] + maxs[0] ) * 0.5f;
+	centre[1] = ( mins[1] + maxs[1] ) * 0.5f;
+	centre[2] = ( mins[2] + maxs[2] ) * 0.5f;
+
+	// is there a split-screen player's projectile at the centre?
+	for ( i = sv_maxclients->integer; i < sv.num_entities; i++ ) {
+		sharedEntity_t *ent = SV_GentityNum( i );
+
+		if ( !SV_LocalHumanNum( ent->r.ownerNum ) ) {
+			continue;
+		}
+		if ( fabs( ent->r.currentOrigin[0] - centre[0] ) > 2.0f
+			|| fabs( ent->r.currentOrigin[1] - centre[1] ) > 2.0f
+			|| fabs( ent->r.currentOrigin[2] - centre[2] ) > 2.0f ) {
+			continue;
+		}
+		owner = ent->r.ownerNum;
+		break;
+	}
+	if ( owner < 0 ) {
+		return count;
+	}
+
+	for ( i = 0, out = 0; i < count; i++ ) {
+		if ( list[i] != owner && SV_LocalHumanNum( list[i] ) ) {
+			continue;
+		}
+		list[out++] = list[i];
+	}
+	return out;
+}
+
+/*
+====================
 SV_GameSystemCalls
 
 The module is making a system call
@@ -354,7 +422,8 @@ intptr_t SV_GameSystemCalls( intptr_t *args ) {
 		SV_UnlinkEntity( VMA(1) );
 		return 0;
 	case G_ENTITIES_IN_BOX:
-		return SV_AreaEntities( VMA(1), VMA(2), VMA(3), args[4] );
+		return SV_CoopFilterSplash( VMA(1), VMA(2), VMA(3),
+			SV_AreaEntities( VMA(1), VMA(2), VMA(3), args[4] ) );
 	case G_ENTITY_CONTACT:
 		return SV_EntityContact( VMA(1), VMA(2), VMA(3), /*int capsule*/ qfalse );
 	case G_ENTITY_CONTACTCAPSULE:

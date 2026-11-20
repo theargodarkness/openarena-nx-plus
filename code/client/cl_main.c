@@ -1234,6 +1234,12 @@ qboolean			cl_dropLocalClient[MAX_LOCAL_CLIENTS];
 cvar_t				*cl_splitscreen;
 cvar_t				*cl_splitscreenVertical;
 cvar_t				*cl_hudScale;
+cvar_t				*cl_enemyMarker;
+cvar_t				*cl_hitMarker;
+
+static qboolean		cl_promptRequested;		// a menu that leads to a game was opened
+static int			cl_promptedPlayers;		// players set up on the controller screen from the menu
+static int			cl_promptGuardTime;
 
 // userinfo keys a player other than the first can override, as p2_name,
 // p3_model and so on; an empty cvar means "same as player 1"
@@ -1269,6 +1275,61 @@ connstate_t CL_LocalClientState( int clientNum ) {
 		return CA_UNINITIALIZED;
 	}
 	return cl_connections[clientNum].state;
+}
+
+/*
+=====================
+CL_LocalClientNum
+
+The server's client number of a local client
+=====================
+*/
+int CL_LocalClientNum( int clientNum ) {
+	if ( clientNum < 0 || clientNum >= MAX_LOCAL_CLIENTS ) {
+		return -1;
+	}
+	return cl_connections[clientNum].clientNum;
+}
+
+/*
+=====================
+CL_MenuArtRegistered
+
+The menus are game data and don't tell the engine which screen is open,
+but each screen loads its own pictures when it opens. The single player
+level select, the skirmish/create server screen and the server browser
+are recognised by theirs, so the controller screen can come up as soon as
+one of them is chosen instead of when the map starts loading.
+=====================
+*/
+void CL_MenuArtRegistered( const char *name ) {
+	static const char *triggers[] = {
+		"menu/art/maps_select",			// single player levels, skirmish / create server
+		"menu/art/level_complete1",		// single player levels
+		"menu/art/gs_arrows_0",			// skirmish / create server
+		"menu/art/unknownmap",			// server browser (and the two above)
+	};
+	int i;
+
+	if ( cl_connections[0].state != CA_DISCONNECTED || !( Key_GetCatcher() & KEYCATCH_UI ) ) {
+		return;
+	}
+	// the menus may load everything once when they start up
+	if ( cls.realtime < cl_promptGuardTime ) {
+		return;
+	}
+
+	for ( i = 0; i < ARRAY_LEN( triggers ); i++ ) {
+		if ( !Q_stricmp( name, triggers[i] ) ) {
+			cl_promptRequested = qtrue;
+			return;
+		}
+	}
+}
+
+void CL_MenuArtReset( void ) {
+	cl_promptRequested = qfalse;
+	cl_promptGuardTime = cls.realtime + 2000;
 }
 
 /*
@@ -1847,13 +1908,17 @@ void CL_MapLoading( void ) {
 
 		// A new local game: let everyone pick up a controller first. However
 		// many players are set up there is how many play.
-		{
+		if ( cl_promptedPlayers > 0 ) {
+			// already done when the menu was opened
+			cl_promptedPlayers = 0;
+		} else {
 			int players = IN_PromptControllers();
 
 			if ( players > 0 ) {
 				Cvar_Set( "cl_splitscreen", va( "%d", players ) );
 			}
 		}
+		cl_promptRequested = qfalse;
 
 		// Every local player needs a slot on the server. The single player
 		// game sizes the server for one human plus its bots, so make room
@@ -3535,6 +3600,21 @@ void CL_Frame ( int msec ) {
 	// an error can leave another local client selected
 	CL_SetLocalClient( 0 );
 
+	// a single player or multiplayer menu was just opened: set up controllers now
+	if ( cl_promptRequested ) {
+		cl_promptRequested = qfalse;
+		if ( clc.state == CA_DISCONNECTED ) {
+			int players = IN_PromptControllers();
+
+			if ( players > 0 ) {
+				Cvar_Set( "cl_splitscreen", va( "%d", players ) );
+				cl_promptedPlayers = players;
+			}
+			// opening the screen again right away would be a nuisance
+			cl_promptGuardTime = cls.realtime + 1500;
+		}
+	}
+
 #ifdef USE_CURL
 	if(clc.downloadCURLM) {
 		CL_cURL_PerformDownload();
@@ -4277,6 +4357,8 @@ void CL_Init( void ) {
 	cl_splitscreen = Cvar_Get ("cl_splitscreen", "1", CVAR_ARCHIVE );
 	cl_splitscreenVertical = Cvar_Get ("cl_splitscreenVertical", "0", CVAR_ARCHIVE );
 	cl_hudScale = Cvar_Get ("cl_hudScale", "1", CVAR_ARCHIVE );
+	cl_enemyMarker = Cvar_Get ("cl_enemyMarker", "0", CVAR_ARCHIVE );	// 1 = red glow, 2 = red name, 3 = both
+	cl_hitMarker = Cvar_Get ("cl_hitMarker", "0", CVAR_ARCHIVE );
 	CL_InitLocalClientCvars();
 
 	Cvar_Get ("name", "UnnamedPlayer", CVAR_USERINFO | CVAR_ARCHIVE );

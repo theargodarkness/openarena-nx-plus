@@ -412,6 +412,7 @@ code needs no changes and players can join or leave without restarting it.
 ====================
 */
 qboolean	cl_worldMapLoaded;
+static qhandle_t	cl_markerShader;
 static char	cl_worldMapName[MAX_QPATH];
 
 static void CL_LoadWorldMap( const char *name ) {
@@ -421,6 +422,7 @@ static void CL_LoadWorldMap( const char *name ) {
 	}
 
 	re.LoadWorld( name );
+	cl_markerShader = 0;	// registrations were flushed before this load
 	Q_strncpyz( cl_worldMapName, name, sizeof( cl_worldMapName ) );
 	cl_worldMapLoaded = qtrue;
 }
@@ -482,9 +484,247 @@ static void CL_DrawStretchPic( float x, float y, float w, float h,
 	re.DrawStretchPic( x, y, w, h, s1, t1, s2, t2, hShader );
 }
 
+/*
+====================
+Engine-drawn aids
+
+Enemy markers and hit markers are added by the engine around each player's
+world view, because the game code that normally draws the HUD is used as
+it comes. Everything here reads the same snapshot the game code is given.
+====================
+*/
+// cl_markerShader (declared above): 0 = not registered since the last flush
+static int			cl_lastHits[MAX_LOCAL_CLIENTS];
+static int			cl_hitMarkerTime[MAX_LOCAL_CLIENTS];
+
+#define	HITMARKER_MSEC	180
+
+static const char *CL_PlayerInfo( int clientNum ) {
+	int offset;
+
+	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
+		return "";
+	}
+	offset = cl.gameState.stringOffsets[CS_PLAYERS + clientNum];
+	if ( !offset ) {
+		return "";
+	}
+	return cl.gameState.stringData + offset;
+}
+
+/*
+====================
+CL_IsEnemy
+
+Everyone else in a free-for-all, the other team in team games. With co-op
+on (sv_splitscreenPvP 0) the other split-screen players are friends.
+====================
+*/
+static qboolean CL_IsEnemy( int clientNum ) {
+	const char	*info = CL_PlayerInfo( clientNum );
+	int			team, myTeam, gametype, i;
+
+	if ( !info[0] || clientNum == cl.snap.ps.clientNum ) {
+		return qfalse;
+	}
+
+	team = atoi( Info_ValueForKey( info, "t" ) );
+	if ( team == TEAM_SPECTATOR ) {
+		return qfalse;
+	}
+
+	if ( !Cvar_VariableIntegerValue( "sv_splitscreenPvP" ) ) {
+		for ( i = 0; i < cl_numLocalClients; i++ ) {
+			if ( CL_LocalClientState( i ) == CA_ACTIVE && CL_LocalClientNum( i ) == clientNum ) {
+				return qfalse;
+			}
+		}
+	}
+
+	gametype = atoi( Info_ValueForKey( cl.gameState.stringData + cl.gameState.stringOffsets[CS_SERVERINFO], "g_gametype" ) );
+	if ( gametype >= GT_TEAM ) {
+		myTeam = atoi( Info_ValueForKey( CL_PlayerInfo( cl.snap.ps.clientNum ), "t" ) );
+		return team != myTeam;
+	}
+	return qtrue;
+}
+
+static void CL_DrawMarkerText( float cx, float y, float size, const char *text, const float *color ) {
+	char	clean[MAX_NAME_LENGTH];
+	int		len, i;
+	float	x;
+
+	Q_strncpyz( clean, text, sizeof( clean ) );
+	Q_CleanStr( clean );
+	len = strlen( clean );
+	if ( !len ) {
+		return;
+	}
+
+	x = cx - len * size * 0.5f;
+	re.SetColor( color );
+	for ( i = 0; i < len; i++, x += size ) {
+		int		ch = clean[i] & 255;
+		float	frow = ( ch >> 4 ) * 0.0625f;
+		float	fcol = ( ch & 15 ) * 0.0625f;
+
+		if ( ch == ' ' ) {
+			continue;
+		}
+		re.DrawStretchPic( x, y, size, size, fcol, frow, fcol + 0.0625f, frow + 0.0625f, cls.charSetShader );
+	}
+	re.SetColor( NULL );
+}
+
+/*
+====================
+CL_AddEnemyHalos
+
+Before the view is rendered: a red glow around every enemy in sight. It is
+part of the scene, so walls hide it like they hide the enemy.
+====================
+*/
+static void CL_AddEnemyHalos( void ) {
+	int i;
+
+	if ( !( cl_enemyMarker->integer & 1 ) || !com_sv_running->integer || !cl.snap.valid ) {
+		return;
+	}
+
+	if ( !cl_markerShader ) {
+		cl_markerShader = re.RegisterShader( "flareShader" );
+		if ( !cl_markerShader ) {
+			cl_markerShader = -1;	// this game's data has none; don't keep asking
+		}
+	}
+	if ( cl_markerShader <= 0 ) {
+		return;
+	}
+
+	for ( i = 0; i < cl.snap.numEntities; i++ ) {
+		entityState_t	*es = &cl.parseEntities[( cl.snap.parseEntitiesNum + i ) & ( MAX_PARSE_ENTITIES - 1 )];
+		refEntity_t		ent;
+
+		if ( es->eType != ET_PLAYER || ( es->eFlags & ( EF_DEAD | EF_NODRAW ) )
+			|| ( es->powerups & ( 1 << PW_INVIS ) ) || !CL_IsEnemy( es->clientNum ) ) {
+			continue;
+		}
+
+		Com_Memset( &ent, 0, sizeof( ent ) );
+		ent.reType = RT_SPRITE;
+		VectorCopy( es->pos.trBase, ent.origin );
+		ent.origin[2] += 8;
+		ent.radius = 38;
+		ent.customShader = cl_markerShader;
+		ent.shaderRGBA[0] = 200;
+		ent.shaderRGBA[1] = 16;
+		ent.shaderRGBA[2] = 10;
+		ent.shaderRGBA[3] = 255;
+		re.AddRefEntityToScene( &ent );
+	}
+}
+
+/*
+====================
+CL_DrawViewOverlays
+
+After the view is rendered: red name tags over enemies that are in sight,
+and the hit marker. "rd" is the view as it was given to the renderer.
+====================
+*/
+static void CL_DrawViewOverlays( const refdef_t *rd ) {
+	static const float	red[4] = { 1.0f, 0.15f, 0.1f, 1.0f };
+	static const float	white[4] = { 1.0f, 1.0f, 1.0f, 0.9f };
+	float				tanX, tanY, charSize;
+	int					i, hits;
+
+	if ( clc.state != CA_ACTIVE || !cl.snap.valid ) {
+		return;
+	}
+
+	charSize = rd->height / 40.0f;
+	if ( charSize < 8.0f ) {
+		charSize = 8.0f;
+	}
+
+	if ( ( cl_enemyMarker->integer & 2 ) && com_sv_running->integer ) {
+		tanX = tan( DEG2RAD( rd->fov_x ) * 0.5f );
+		tanY = tan( DEG2RAD( rd->fov_y ) * 0.5f );
+
+		for ( i = 0; i < cl.snap.numEntities; i++ ) {
+			entityState_t	*es = &cl.parseEntities[( cl.snap.parseEntitiesNum + i ) & ( MAX_PARSE_ENTITIES - 1 )];
+			vec3_t			head, local;
+			float			fwd, right, up, px, py;
+			trace_t			tr;
+
+			if ( es->eType != ET_PLAYER || ( es->eFlags & ( EF_DEAD | EF_NODRAW ) )
+				|| ( es->powerups & ( 1 << PW_INVIS ) ) || !CL_IsEnemy( es->clientNum ) ) {
+				continue;
+			}
+
+			VectorCopy( es->pos.trBase, head );
+			head[2] += 48;
+
+			VectorSubtract( head, rd->vieworg, local );
+			fwd = DotProduct( local, rd->viewaxis[0] );
+			if ( fwd < 16.0f || tanX <= 0.0f || tanY <= 0.0f ) {
+				continue;	// behind the view
+			}
+			right = -DotProduct( local, rd->viewaxis[1] );
+			up = DotProduct( local, rd->viewaxis[2] );
+
+			px = rd->x + rd->width * 0.5f * ( 1.0f + right / ( fwd * tanX ) );
+			py = rd->y + rd->height * 0.5f * ( 1.0f - up / ( fwd * tanY ) );
+			if ( px < rd->x || px > rd->x + rd->width || py < rd->y + charSize || py > rd->y + rd->height ) {
+				continue;
+			}
+
+			// not through walls
+			CM_BoxTrace( &tr, rd->vieworg, head, NULL, NULL, 0, CONTENTS_SOLID, qfalse );
+			if ( tr.fraction < 1.0f ) {
+				continue;
+			}
+
+			CL_DrawMarkerText( px, py - charSize, charSize, Info_ValueForKey( CL_PlayerInfo( es->clientNum ), "n" ), red );
+		}
+	}
+
+	// hit marker: the game counts our hits in the player state
+	hits = cl.snap.ps.persistant[PERS_HITS];
+	if ( hits > cl_lastHits[cl_localClient] && cl_hitMarker->integer ) {
+		cl_hitMarkerTime[cl_localClient] = cls.realtime;
+	}
+	cl_lastHits[cl_localClient] = hits;
+
+	if ( cl_hitMarker->integer && cl_hitMarkerTime[cl_localClient]
+		&& cls.realtime - cl_hitMarkerTime[cl_localClient] < HITMARKER_MSEC ) {
+		// four short diagonal strokes around the crosshair
+		float cx = rd->x + rd->width * 0.5f;
+		float cy = rd->y + rd->height * 0.5f;
+		float dot = rd->height / 180.0f;
+		int   step, sx, sy;
+
+		if ( dot < 2.0f ) {
+			dot = 2.0f;
+		}
+
+		re.SetColor( white );
+		for ( sx = -1; sx <= 1; sx += 2 ) {
+			for ( sy = -1; sy <= 1; sy += 2 ) {
+				for ( step = 3; step <= 6; step++ ) {
+					re.DrawStretchPic( cx + sx * step * dot - dot * 0.5f, cy + sy * step * dot - dot * 0.5f,
+						dot, dot, 0, 0, 0, 0, cls.whiteShader );
+				}
+			}
+		}
+		re.SetColor( NULL );
+	}
+}
+
 static void CL_RenderScene( const refdef_t *fd ) {
 	refdef_t	rd;
 	refdef_t	hudRd;
+	qboolean	worldView;
 	int			vx, vy, vw, vh;
 	float		sx, sy;
 
@@ -505,8 +745,16 @@ static void CL_RenderScene( const refdef_t *fd ) {
 		fd = &hudRd;
 	}
 
+	worldView = !( fd->rdflags & RDF_NOWORLDMODEL );
+	if ( worldView ) {
+		CL_AddEnemyHalos();
+	}
+
 	if ( !CL_SplitScreenActive() ) {
 		re.RenderScene( fd );
+		if ( worldView ) {
+			CL_DrawViewOverlays( fd );
+		}
 		return;
 	}
 
@@ -544,6 +792,9 @@ static void CL_RenderScene( const refdef_t *fd ) {
 	}
 
 	re.RenderScene( &rd );
+	if ( worldView ) {
+		CL_DrawViewOverlays( &rd );
+	}
 }
 
 static int	FloatAsInt( float f ) {
