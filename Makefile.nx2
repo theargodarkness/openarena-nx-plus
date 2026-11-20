@@ -17,7 +17,7 @@ include $(DEVKITPRO)/libounce/switch2_rules
 # APP_* fill the .nacp; ICON (.jpg) falls back to <TARGET>.jpg, icon.jpg, then the libnx default.
 #---------------------------------------------------------------------------------
 APP_AUTHOR	:=	faithvoid
-APP_VERSION	:=	0.7.8
+APP_VERSION	:=	0.8.0
 
 # GAME selects what the NRO plays. Both are the same engine and features:
 #   openarena (default)  standalone, data in baseoa/
