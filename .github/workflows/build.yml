@@ -49,7 +49,14 @@ jobs:
       run: |
         git clone https://github.com/ouncebrew/ounce-devkit.git /tmp/ounce-devkit
         cd /tmp/ounce-devkit
-        sh install.sh
+        # the installer syncs with devkitPro's package server, which turns
+        # CI runners away now and then; give it a few tries
+        for attempt in 1 2 3 4 5; do
+          sh install.sh && exit 0
+          echo "Ounce SDK install failed (attempt $attempt), retrying in 30s"
+          sleep 30
+        done
+        exit 1
 
     - name: Build OpenArenaNX and Quake3NX (Switch 2)
       run: |
