@@ -1236,10 +1236,19 @@ cvar_t				*cl_splitscreenVertical;
 cvar_t				*cl_hudScale;
 cvar_t				*cl_enemyMarker;
 cvar_t				*cl_hitMarker;
+cvar_t				*cl_hitMarkerShape;
+cvar_t				*cl_hitMarkerSize;
+cvar_t				*cl_hitMarkerColor;
+cvar_t				*cl_hitMarkerTime_ms;
+cvar_t				*cl_radar;
+cvar_t				*cl_radarSize;
+cvar_t				*cl_radarSweep;
+cvar_t				*cl_radarRange;
 
 static qboolean		cl_promptRequested;		// a menu that leads to a game was opened
 static int			cl_promptedPlayers;		// players set up on the controller screen from the menu
 static int			cl_promptGuardTime;
+static qboolean		cl_promptDone;			// the menus already brought the controller screen up for the next game
 
 // userinfo keys a player other than the first can override, as p2_name,
 // p3_model and so on; an empty cvar means "same as player 1"
@@ -1316,6 +1325,11 @@ void CL_MenuArtRegistered( const char *name ) {
 	}
 	// the menus may load everything once when they start up
 	if ( cls.realtime < cl_promptGuardTime ) {
+		return;
+	}
+	// Once per game: the screens that follow (skill, bots, server options)
+	// load some of the same pictures.
+	if ( cl_promptDone ) {
 		return;
 	}
 
@@ -1908,7 +1922,7 @@ void CL_MapLoading( void ) {
 
 		// A new local game: let everyone pick up a controller first. However
 		// many players are set up there is how many play.
-		if ( cl_promptedPlayers > 0 ) {
+		if ( cl_promptDone ) {
 			// already done when the menu was opened
 			cl_promptedPlayers = 0;
 		} else {
@@ -1919,6 +1933,7 @@ void CL_MapLoading( void ) {
 			}
 		}
 		cl_promptRequested = qfalse;
+		cl_promptDone = qfalse;		// the next game gets its own
 
 		// Every local player needs a slot on the server. The single player
 		// game sizes the server for one human plus its bots, so make room
@@ -3603,8 +3618,10 @@ void CL_Frame ( int msec ) {
 	// a single player or multiplayer menu was just opened: set up controllers now
 	if ( cl_promptRequested ) {
 		cl_promptRequested = qfalse;
-		if ( clc.state == CA_DISCONNECTED ) {
+		if ( clc.state == CA_DISCONNECTED && !cl_promptDone ) {
 			int players = IN_PromptControllers();
+
+			cl_promptDone = qtrue;
 
 			if ( players > 0 ) {
 				Cvar_Set( "cl_splitscreen", va( "%d", players ) );
@@ -4359,6 +4376,14 @@ void CL_Init( void ) {
 	cl_hudScale = Cvar_Get ("cl_hudScale", "1", CVAR_ARCHIVE );
 	cl_enemyMarker = Cvar_Get ("cl_enemyMarker", "0", CVAR_ARCHIVE );	// 1 = red glow, 2 = red name, 3 = both
 	cl_hitMarker = Cvar_Get ("cl_hitMarker", "0", CVAR_ARCHIVE );
+	cl_hitMarkerShape = Cvar_Get ("cl_hitMarkerShape", "0", CVAR_ARCHIVE );	// 0 X, 1 plus, 2 dot, 3 box
+	cl_hitMarkerSize = Cvar_Get ("cl_hitMarkerSize", "1", CVAR_ARCHIVE );
+	cl_hitMarkerColor = Cvar_Get ("cl_hitMarkerColor", "0", CVAR_ARCHIVE );	// 0 white, 1 red, 2 yellow, 3 green, 4 cyan
+	cl_hitMarkerTime_ms = Cvar_Get ("cl_hitMarkerTime", "180", CVAR_ARCHIVE );
+	cl_radar = Cvar_Get ("cl_radar", "0", CVAR_ARCHIVE );
+	cl_radarSize = Cvar_Get ("cl_radarSize", "0.25", CVAR_ARCHIVE );			// fraction of the view height
+	cl_radarSweep = Cvar_Get ("cl_radarSweep", "3", CVAR_ARCHIVE );			// seconds per turn
+	cl_radarRange = Cvar_Get ("cl_radarRange", "1500", CVAR_ARCHIVE );		// map units from centre to edge
 	CL_InitLocalClientCvars();
 
 	Cvar_Get ("name", "UnnamedPlayer", CVAR_USERINFO | CVAR_ARCHIVE );

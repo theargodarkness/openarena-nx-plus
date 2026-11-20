@@ -35,7 +35,7 @@ typedef struct {
 	const char	*def;		// used if nothing registered the cvar yet
 	float		min, max, step;
 	qboolean	toggle;
-	const char	*choices[4];	// for a setting with a few named values (0, 1, 2 ...)
+	const char	*choices[6];	// for a setting with a few named values (0, 1, 2 ...)
 } padMenuItem_t;
 
 static const padMenuItem_t padMenuItems[] = {
@@ -54,10 +54,18 @@ static const padMenuItem_t padMenuItems[] = {
 	{ "Players can hurt each other", "sv_splitscreenPvP", "1", 0, 1, 1, qtrue },
 	{ "Highlight enemies",        "cl_enemyMarker",     "0",    0, 3, 1, qfalse, { "Off", "Red glow", "Red name", "Glow and name" } },
 	{ "Hit markers",              "cl_hitMarker",       "0",    0, 1, 1, qtrue },
+	{ "Hit marker shape",         "cl_hitMarkerShape",  "0",    0, 3, 1, qfalse, { "X", "Plus", "Dot", "Box" } },
+	{ "Hit marker size",          "cl_hitMarkerSize",   "1",    0.5f, 3.0f, 0.25f, qfalse },
+	{ "Hit marker colour",        "cl_hitMarkerColor",  "0",    0, 4, 1, qfalse, { "White", "Red", "Yellow", "Green", "Cyan" } },
+	{ "Hit marker time (ms)",     "cl_hitMarkerTime",   "180",  100.0f, 600.0f, 20.0f, qfalse },
+	{ "Radar",                    "cl_radar",           "0",    0, 1, 1, qtrue },
+	{ "Radar size",               "cl_radarSize",       "0.25", 0.1f, 0.5f, 0.05f, qfalse },
+	{ "Radar sweep (seconds)",    "cl_radarSweep",      "3",    1.0f, 8.0f, 0.5f, qfalse },
 	{ "Show controller debug info", "in_padDebug",     "0",    0, 1, 1, qtrue },
 };
 
 #define NUM_PADMENU_ITEMS	( (int)ARRAY_LEN( padMenuItems ) )
+#define PADMENU_VISIBLE		16		// rows on screen; the list scrolls with the cursor
 
 static qboolean	padMenuActive = qfalse;
 static int		padMenuCursor = 0;
@@ -116,7 +124,7 @@ static void CL_PadMenuAdjust( int dir ) {
 	if ( value > item->max ) {
 		value = item->max;
 	}
-	Cvar_Set( item->cvar, va( "%.2f", value ) );
+	Cvar_Set( item->cvar, item->step >= 1.0f ? va( "%d", (int)value ) : va( "%.2f", value ) );
 }
 
 /*
@@ -176,21 +184,38 @@ void CL_PadMenuDraw( void ) {
 	static vec4_t	titleColor = { 1.0f, 0.65f, 0.1f, 1.0f };
 	const int		rowHeight = 18;
 	const int		boxW = 520;
-	const int		boxH = 76 + NUM_PADMENU_ITEMS * rowHeight;
+	const int		rows = NUM_PADMENU_ITEMS < PADMENU_VISIBLE ? NUM_PADMENU_ITEMS : PADMENU_VISIBLE;
+	const int		boxH = 76 + rows * rowHeight;
 	const int		boxX = ( SCREEN_WIDTH - boxW ) / 2;
 	const int		boxY = ( SCREEN_HEIGHT - boxH ) / 2;
 	const int		barX = boxX + 316, barW = 134;
-	int				i, y;
+	int				i, y, first;
 
 	if ( !padMenuActive ) {
 		return;
+	}
+
+	// keep the cursor in the middle of the visible part where possible
+	first = padMenuCursor - rows / 2;
+	if ( first > NUM_PADMENU_ITEMS - rows ) {
+		first = NUM_PADMENU_ITEMS - rows;
+	}
+	if ( first < 0 ) {
+		first = 0;
 	}
 
 	SCR_FillRect( boxX, boxY, boxW, boxH, backColor );
 	SCR_DrawStringExt( boxX + 16, boxY + 12, 12, "CONTROLLER SETTINGS", titleColor, qtrue, qfalse );
 
 	y = boxY + 40;
-	for ( i = 0; i < NUM_PADMENU_ITEMS; i++, y += rowHeight ) {
+	if ( first > 0 ) {
+		SCR_DrawStringExt( boxX + boxW - 60, boxY + 14, 8, "more ^", textColor, qtrue, qfalse );
+	}
+	if ( first + rows < NUM_PADMENU_ITEMS ) {
+		SCR_DrawStringExt( boxX + boxW - 60, boxY + boxH - 24, 8, "more v", textColor, qtrue, qfalse );
+	}
+
+	for ( i = first; i < first + rows; i++, y += rowHeight ) {
 		const padMenuItem_t	*item = &padMenuItems[i];
 		float				value = Cvar_VariableValue( item->cvar );
 		float				*color = ( i == padMenuCursor ) ? selColor : textColor;
@@ -221,7 +246,7 @@ void CL_PadMenuDraw( void ) {
 			SCR_FillRect( barX, y + 2, barW, 5, barColor );
 			SCR_FillRect( barX, y + 2, barW * frac, 5, fillColor );
 			SCR_FillRect( barX + barW * frac - 2, y - 1, 4, 11, color );
-			SCR_DrawStringExt( barX + barW + 12, y, 8, va( "%.2f", value ), color, qtrue, qfalse );
+			SCR_DrawStringExt( barX + barW + 12, y, 8, item->step >= 1.0f ? va( "%d", (int)value ) : va( "%.2f", value ), color, qtrue, qfalse );
 		}
 	}
 

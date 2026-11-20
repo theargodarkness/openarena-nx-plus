@@ -497,7 +497,6 @@ it comes. Everything here reads the same snapshot the game code is given.
 static int			cl_lastHits[MAX_LOCAL_CLIENTS];
 static int			cl_hitMarkerTime[MAX_LOCAL_CLIENTS];
 
-#define	HITMARKER_MSEC	180
 
 static const char *CL_PlayerInfo( int clientNum ) {
 	int offset;
@@ -624,6 +623,188 @@ static void CL_AddEnemyHalos( void ) {
 	}
 }
 
+static void CL_FillRect( float x, float y, float w, float h ) {
+	re.DrawStretchPic( x, y, w, h, 0, 0, 0, 0, cls.whiteShader );
+}
+
+/*
+====================
+CL_DrawRadar
+
+A sweeping radar in the corner of the view, with the player in the middle
+and "ahead" at the top. Friends are shown all the time. Enemies show up as
+the sweep line passes over them, at the spot they were in at that moment,
+and fade until the next pass - so it tells you where someone was, not
+where they are. It covers what the server has sent this client, which is
+roughly the rooms in view of the player's position.
+====================
+*/
+typedef struct {
+	float	origin[2];
+	int		time;
+} radarPing_t;
+
+static radarPing_t	cl_radarPings[MAX_LOCAL_CLIENTS][MAX_CLIENTS];
+static float		cl_radarSweepAngle[MAX_LOCAL_CLIENTS];
+
+static void CL_DrawRadar( const refdef_t *rd ) {
+	static const float	backColor[4]   = { 0.0f, 0.08f, 0.0f, 0.5f };
+	static const float	lineColor[4]   = { 0.2f, 0.9f, 0.2f, 0.7f };
+	static const float	faintColor[4]  = { 0.2f, 0.9f, 0.2f, 0.2f };
+	static const float	selfColor[4]   = { 1.0f, 1.0f, 1.0f, 1.0f };
+	static const float	friendColor[4] = { 0.3f, 1.0f, 0.3f, 1.0f };
+	float				enemyColor[4]  = { 1.0f, 0.15f, 0.1f, 1.0f };
+	radarPing_t			*pings = cl_radarPings[cl_localClient];
+	vec2_t				fwd, right;
+	float				size, half, cx, cy, range, len, prev, cur, period, blip, line;
+	int					i, periodMsec;
+
+	if ( !cl_radar->integer || !com_sv_running->integer ) {
+		return;
+	}
+
+	size = rd->height * cl_radarSize->value;
+	if ( size < 32.0f ) {
+		size = 32.0f;
+	}
+	if ( size > rd->height * 0.6f ) {
+		size = rd->height * 0.6f;
+	}
+	half = size * 0.5f;
+	cx = rd->x + rd->height * 0.03f + half;
+	cy = rd->y + rd->height * 0.03f + half;
+	blip = size / 22.0f;
+	line = size / 90.0f;
+	if ( line < 1.0f ) {
+		line = 1.0f;
+	}
+
+	range = cl_radarRange->value;
+	if ( range < 200.0f ) {
+		range = 200.0f;
+	}
+
+	period = cl_radarSweep->value;
+	if ( period < 0.5f ) {
+		period = 0.5f;
+	}
+	periodMsec = (int)( period * 1000.0f );
+
+	// "ahead" on the map plane
+	fwd[0] = rd->viewaxis[0][0];
+	fwd[1] = rd->viewaxis[0][1];
+	len = sqrt( fwd[0] * fwd[0] + fwd[1] * fwd[1] );
+	if ( len < 0.001f ) {
+		fwd[0] = 1.0f;
+		fwd[1] = 0.0f;
+	} else {
+		fwd[0] /= len;
+		fwd[1] /= len;
+	}
+	right[0] = fwd[1];
+	right[1] = -fwd[0];
+
+	// the sweep: one turn per period, clockwise from the top
+	prev = cl_radarSweepAngle[cl_localClient];
+	cur = ( ( cls.realtime % periodMsec ) / (float)periodMsec ) * 2.0f * M_PI;
+	cl_radarSweepAngle[cl_localClient] = cur;
+
+	// panel
+	re.SetColor( backColor );
+	CL_FillRect( cx - half, cy - half, size, size );
+	re.SetColor( faintColor );
+	CL_FillRect( cx - half, cy - line * 0.5f, size, line );
+	CL_FillRect( cx - line * 0.5f, cy - half, line, size );
+	re.SetColor( lineColor );
+	CL_FillRect( cx - half, cy - half, size, line );
+	CL_FillRect( cx - half, cy + half - line, size, line );
+	CL_FillRect( cx - half, cy - half, line, size );
+	CL_FillRect( cx + half - line, cy - half, line, size );
+
+	// sweep line, out to the edge of the square
+	{
+		float	dx = sin( cur ), dy = -cos( cur );
+		float	m = fabs( dx ) > fabs( dy ) ? fabs( dx ) : fabs( dy );
+		float	reach = half / m;
+		int		n = 18;
+
+		for ( i = 1; i <= n; i++ ) {
+			float t = reach * i / n;
+
+			CL_FillRect( cx + dx * t - line, cy + dy * t - line, line * 2.0f, line * 2.0f );
+		}
+	}
+
+	for ( i = 0; i < cl.snap.numEntities; i++ ) {
+		entityState_t	*es = &cl.parseEntities[( cl.snap.parseEntitiesNum + i ) & ( MAX_PARSE_ENTITIES - 1 )];
+		float			rx, ry, x, y, angle;
+		qboolean		passed;
+
+		if ( es->eType != ET_PLAYER || es->clientNum < 0 || es->clientNum >= MAX_CLIENTS
+			|| es->clientNum == cl.snap.ps.clientNum
+			|| ( es->eFlags & ( EF_DEAD | EF_NODRAW ) ) || ( es->powerups & ( 1 << PW_INVIS ) ) ) {
+			continue;
+		}
+
+		rx = es->pos.trBase[0] - rd->vieworg[0];
+		ry = es->pos.trBase[1] - rd->vieworg[1];
+		x = ( rx * right[0] + ry * right[1] ) / range;
+		y = ( rx * fwd[0] + ry * fwd[1] ) / range;
+
+		if ( !CL_IsEnemy( es->clientNum ) ) {
+			// friends are always on the radar
+			if ( fabs( x ) <= 1.0f && fabs( y ) <= 1.0f && atoi( Info_ValueForKey( CL_PlayerInfo( es->clientNum ), "t" ) ) != TEAM_SPECTATOR ) {
+				re.SetColor( friendColor );
+				CL_FillRect( cx + x * half - blip * 0.5f, cy - y * half - blip * 0.5f, blip, blip );
+			}
+			continue;
+		}
+
+		// did the sweep line just pass this enemy?
+		angle = atan2( x, y );
+		if ( angle < 0.0f ) {
+			angle += 2.0f * M_PI;
+		}
+		passed = ( cur >= prev ) ? ( angle > prev && angle <= cur ) : ( angle > prev || angle <= cur );
+		if ( passed ) {
+			pings[es->clientNum].origin[0] = es->pos.trBase[0];
+			pings[es->clientNum].origin[1] = es->pos.trBase[1];
+			pings[es->clientNum].time = cls.realtime;
+		}
+	}
+
+	// enemies where the sweep last saw them, fading until it comes round again
+	for ( i = 0; i < MAX_CLIENTS; i++ ) {
+		float	rx, ry, x, y;
+		int		age;
+
+		if ( !pings[i].time ) {
+			continue;
+		}
+		age = cls.realtime - pings[i].time;
+		if ( age < 0 || age >= periodMsec ) {
+			pings[i].time = 0;
+			continue;
+		}
+
+		rx = pings[i].origin[0] - rd->vieworg[0];
+		ry = pings[i].origin[1] - rd->vieworg[1];
+		x = ( rx * right[0] + ry * right[1] ) / range;
+		y = ( rx * fwd[0] + ry * fwd[1] ) / range;
+		if ( fabs( x ) > 1.0f || fabs( y ) > 1.0f ) {
+			continue;
+		}
+
+		enemyColor[3] = 1.0f - (float)age / periodMsec;
+		re.SetColor( enemyColor );
+		CL_FillRect( cx + x * half - blip * 0.5f, cy - y * half - blip * 0.5f, blip, blip );
+	}
+
+	re.SetColor( selfColor );
+	CL_FillRect( cx - blip * 0.4f, cy - blip * 0.4f, blip * 0.8f, blip * 0.8f );
+	re.SetColor( NULL );
+}
+
 /*
 ====================
 CL_DrawViewOverlays
@@ -634,7 +815,6 @@ and the hit marker. "rd" is the view as it was given to the renderer.
 */
 static void CL_DrawViewOverlays( const refdef_t *rd ) {
 	static const float	red[4] = { 1.0f, 0.15f, 0.1f, 1.0f };
-	static const float	white[4] = { 1.0f, 1.0f, 1.0f, 0.9f };
 	float				tanX, tanY, charSize;
 	int					i, hits;
 
@@ -689,6 +869,8 @@ static void CL_DrawViewOverlays( const refdef_t *rd ) {
 		}
 	}
 
+	CL_DrawRadar( rd );
+
 	// hit marker: the game counts our hits in the player state
 	hits = cl.snap.ps.persistant[PERS_HITS];
 	if ( hits > cl_lastHits[cl_localClient] && cl_hitMarker->integer ) {
@@ -696,28 +878,78 @@ static void CL_DrawViewOverlays( const refdef_t *rd ) {
 	}
 	cl_lastHits[cl_localClient] = hits;
 
-	if ( cl_hitMarker->integer && cl_hitMarkerTime[cl_localClient]
-		&& cls.realtime - cl_hitMarkerTime[cl_localClient] < HITMARKER_MSEC ) {
-		// four short diagonal strokes around the crosshair
-		float cx = rd->x + rd->width * 0.5f;
-		float cy = rd->y + rd->height * 0.5f;
-		float dot = rd->height / 180.0f;
-		int   step, sx, sy;
+	if ( cl_hitMarker->integer && cl_hitMarkerTime[cl_localClient] ) {
+		int duration = cl_hitMarkerTime_ms->integer;
+		int age = cls.realtime - cl_hitMarkerTime[cl_localClient];
 
-		if ( dot < 2.0f ) {
-			dot = 2.0f;
+		if ( duration < 50 ) {
+			duration = 50;
 		}
+		if ( age >= 0 && age < duration ) {
+			static const float colors[][3] = {
+				{ 1.0f, 1.0f, 1.0f },	// white
+				{ 1.0f, 0.2f, 0.15f },	// red
+				{ 1.0f, 0.9f, 0.2f },	// yellow
+				{ 0.3f, 1.0f, 0.3f },	// green
+				{ 0.3f, 0.9f, 1.0f },	// cyan
+			};
+			float	color[4];
+			float	cx = rd->x + rd->width * 0.5f;
+			float	cy = rd->y + rd->height * 0.5f;
+			float	size = cl_hitMarkerSize->value;
+			float	dot;
+			int		c = cl_hitMarkerColor->integer;
+			int		step, sx, sy;
 
-		re.SetColor( white );
-		for ( sx = -1; sx <= 1; sx += 2 ) {
-			for ( sy = -1; sy <= 1; sy += 2 ) {
-				for ( step = 3; step <= 6; step++ ) {
-					re.DrawStretchPic( cx + sx * step * dot - dot * 0.5f, cy + sy * step * dot - dot * 0.5f,
-						dot, dot, 0, 0, 0, 0, cls.whiteShader );
-				}
+			if ( c < 0 || c >= (int)ARRAY_LEN( colors ) ) {
+				c = 0;
 			}
+			if ( size < 0.25f ) {
+				size = 0.25f;
+			}
+			dot = rd->height / 180.0f * size;
+			if ( dot < 1.5f ) {
+				dot = 1.5f;
+			}
+
+			VectorCopy( colors[c], color );
+			color[3] = 1.0f - 0.6f * age / duration;	// fades a little as it goes
+			re.SetColor( color );
+
+			switch ( cl_hitMarkerShape->integer ) {
+			default:
+			case 0:	// X: four short diagonal strokes around the crosshair
+				for ( sx = -1; sx <= 1; sx += 2 ) {
+					for ( sy = -1; sy <= 1; sy += 2 ) {
+						for ( step = 3; step <= 6; step++ ) {
+							CL_FillRect( cx + sx * step * dot - dot * 0.5f, cy + sy * step * dot - dot * 0.5f, dot, dot );
+						}
+					}
+				}
+				break;
+			case 1:	// plus: four strokes straight out
+				CL_FillRect( cx - 7 * dot, cy - dot * 0.5f, 4 * dot, dot );
+				CL_FillRect( cx + 3 * dot, cy - dot * 0.5f, 4 * dot, dot );
+				CL_FillRect( cx - dot * 0.5f, cy - 7 * dot, dot, 4 * dot );
+				CL_FillRect( cx - dot * 0.5f, cy + 3 * dot, dot, 4 * dot );
+				break;
+			case 2:	// dot
+				CL_FillRect( cx - 1.5f * dot, cy - 1.5f * dot, 3 * dot, 3 * dot );
+				break;
+			case 3:	// box: four corner brackets
+				for ( sx = -1; sx <= 1; sx += 2 ) {
+					for ( sy = -1; sy <= 1; sy += 2 ) {
+						float ex = cx + sx * 6 * dot;
+						float ey = cy + sy * 6 * dot;
+
+						CL_FillRect( sx > 0 ? ex - 3 * dot : ex, ey - dot * 0.5f, 3 * dot, dot );
+						CL_FillRect( ex - dot * 0.5f, sy > 0 ? ey - 3 * dot : ey, dot, 3 * dot );
+					}
+				}
+				break;
+			}
+			re.SetColor( NULL );
 		}
-		re.SetColor( NULL );
 	}
 }
 
